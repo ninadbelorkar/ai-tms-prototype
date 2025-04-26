@@ -206,7 +206,6 @@ public/build/
 
 # Gatsby cache and generated files
 .cache/
-public
 
 # SvelteKit cache and generated files
 .svelte-kit

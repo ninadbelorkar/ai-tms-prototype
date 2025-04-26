@@ -1,0 +1,163 @@
+/* Styles specific to the App layout and shared elements */
+.App {
+    max-width: 900px; /* Max width for content */
+    margin: 0 auto; /* Center the content */
+    padding: 20px;
+  }
+  
+  .App-header {
+    background-color: #282c34;
+    padding: 25px;
+    color: white;
+    text-align: center;
+    margin-bottom: 40px;
+    border-radius: 8px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+  }
+  
+  .App-header h1 {
+    margin: 0;
+    font-size: 1.8rem;
+  }
+  
+  main {
+    display: flex;
+    flex-direction: column;
+    gap: 30px; /* Spacing between component sections */
+  }
+  
+  /* Styles for individual component sections */
+  .component-section {
+    background-color: #ffffff; /* White background for sections */
+    border: 1px solid #dfe4e8; /* Softer border */
+    border-radius: 8px;
+    padding: 25px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+    transition: box-shadow 0.3s ease;
+  }
+  
+  .component-section:hover {
+     box-shadow: 0 4px 10px rgba(0,0,0,0.08);
+  }
+  
+  .component-section h2 {
+    margin-top: 0;
+    margin-bottom: 20px;
+    color: #333;
+    border-bottom: 2px solid #007bff; /* Accent border */
+    padding-bottom: 10px;
+    font-size: 1.4rem;
+  }
+  
+  /* Form element styling */
+  textarea,
+  input[type="text"],
+  input[type="number"],
+  select {
+    display: block; /* Ensure they take full width */
+    width: 100%; /* Use full width of container */
+    padding: 12px;
+    margin-bottom: 15px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 1rem;
+    transition: border-color 0.3s ease;
+  }
+  
+  textarea:focus,
+  input[type="text"]:focus,
+  input[type="number"]:focus,
+  select:focus {
+    border-color: #007bff;
+    outline: none; /* Remove default focus outline */
+    box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25); /* Subtle focus shadow */
+  }
+  
+  
+  textarea {
+    min-height: 120px;
+    resize: vertical;
+    line-height: 1.5;
+  }
+  
+  label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 600;
+    color: #555;
+  }
+  
+  /* Specific div wrappers for label/select pairs for better spacing */
+  .form-group {
+      margin-bottom: 15px;
+  }
+  
+  button {
+    background-color: #007bff;
+    color: white;
+    border: none;
+    padding: 12px 25px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 1rem;
+    font-weight: 600;
+    transition: background-color 0.2s ease, transform 0.1s ease;
+  }
+  
+  button:hover:not(:disabled) {
+    background-color: #0056b3;
+    transform: translateY(-1px); /* Slight lift on hover */
+  }
+  
+  button:disabled {
+    background-color: #a0cfff; /* Lighter blue when disabled */
+    cursor: not-allowed;
+  }
+  
+  /* Results area */
+  .results {
+    margin-top: 25px;
+    padding: 20px;
+    background-color: #f8f9fa; /* Very light grey for results */
+    border: 1px solid #e9ecef; /* Light border */
+    border-radius: 4px;
+    white-space: pre-wrap; /* Preserve whitespace and line breaks from AI */
+    font-family: 'Courier New', Courier, monospace; /* Monospace for code-like output */
+    font-size: 0.95rem;
+    line-height: 1.6;
+    max-height: 400px; /* Prevent excessively long results */
+    overflow-y: auto; /* Add scrollbar if needed */
+  }
+  
+  .results h3 {
+      margin-top: 0;
+      margin-bottom: 15px;
+      color: #333;
+      font-size: 1.2rem;
+      font-family: sans-serif; /* Use default font for heading */
+  }
+  
+  /* Error message styling */
+  .error {
+    color: #dc3545; /* Bootstrap danger color */
+    font-weight: bold;
+    margin-top: 15px;
+    padding: 10px;
+    background-color: #f8d7da; /* Light red background */
+    border: 1px solid #f5c6cb; /* Red border */
+    border-radius: 4px;
+  }
+  
+  /* Loading indicator styling (Optional: Add a spinner later) */
+  .loading-indicator {
+      font-style: italic;
+      color: #555;
+      margin-top: 10px;
+  }
+  
+  /* Horizontal rule for separation */
+  hr {
+    border: none;
+    border-top: 1px solid #dee2e6; /* Slightly darker separator */
+    margin: 40px 0;
+  }

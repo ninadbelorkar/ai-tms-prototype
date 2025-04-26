@@ -1,0 +1,87 @@
+# File: .github/workflows/ci.yml
+
+name: Backend & Frontend CI Checks # Name of the workflow displayed on GitHub
+
+# Controls when the workflow will run
+on:
+  push:
+    branches: [ "main" ] # Run on pushes to the main branch
+  pull_request:
+    branches: [ "main" ] # Run on pull requests targeting the main branch
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  # Define a single job called "build-and-check"
+  build-and-check:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest # Use the latest stable Ubuntu Linux runner
+
+    steps:
+      # --- Step 1: Get the code ---
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4 # Official action to check out your repository code
+
+      # --- Step 2: Setup Node.js Environment ---
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18.x' # Specify your Node.js version (e.g., 18.x, 20.x)
+          cache: 'npm' # Cache npm dependencies for faster builds
+          cache-dependency-path: frontend/package-lock.json # Cache based on lock file
+
+      # --- Step 3: Install Frontend Dependencies ---
+      - name: Install Frontend Dependencies
+        working-directory: ./frontend # Run this command inside the frontend directory
+        run: npm ci # 'ci' is generally preferred over 'install' in CI for clean installs based on package-lock.json
+
+      # --- Step 4: Build Frontend ---
+      - name: Build Frontend Application
+        working-directory: ./frontend
+        run: npm run build # Executes the build script defined in frontend/package.json
+        env:
+          CI: true # Often needed by build scripts, especially in React
+
+      # --- Step 5: Setup Python Environment ---
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' # Specify your Python version (e.g., 3.9, 3.10, 3.11)
+          cache: 'pip' # Cache pip dependencies
+          cache-dependency-path: backend/requirements.txt # Cache based on requirements file
+
+      # --- Step 6: Install Backend Dependencies ---
+      - name: Install Backend Dependencies
+        working-directory: ./backend # Run this command inside the backend directory
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # --- Step 7: Lint Backend Code with Flake8 ---
+      - name: Lint with Flake8
+        working-directory: ./backend
+        run: |
+          pip install flake8 # Install Flake8 linter
+          # stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      # --- Optional: Add Testing Steps Later ---
+      # - name: Run Frontend Tests
+      #   working-directory: ./frontend
+      #   run: npm test -- --watchAll=false # Run tests non-interactively
+      #
+      # - name: Run Backend Tests (if you add them, e.g., using pytest)
+      #   working-directory: ./backend
+      #   env: # IMPORTANT: See notes below about API Keys for tests!
+      #     GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY_CI }} # Example using a secret
+      #   run: |
+      #     pip install pytest
+      #     pytest
+
+      # --- Security Note ---
+      # If you add tests that ACTUALLY call the Google AI API, you MUST NOT hardcode the API key here.
+      # Use GitHub Secrets (see instructions below) to store the key securely.
+      # The example above shows how to reference a secret named GOOGLE_API_KEY_CI.

@@ -1,0 +1,4 @@
+Flask>=2.0          # Web framework
+Flask-Cors>=3.0     # Handles Cross-Origin Resource Sharing (allows frontend to call backend)
+python-dotenv>=0.19 # Reads environment variables from the .env file
+google-generativeai>=0.3 # Google AI Python SDK

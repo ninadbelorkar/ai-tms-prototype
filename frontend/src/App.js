@@ -1,9 +1,11 @@
+// File: frontend/src/App.js (Additions)
 import React from 'react';
-import './App.css'; // Import main styles
+import './App.css';
 import TestCaseSuggester from './components/TestCaseSuggester';
 import DefectAnalyzer from './components/DefectAnalyzer';
 import AutomationRecommender from './components/AutomationRecommender';
-import CodeChangeAnalyzer from './components/CodeChangeAnalyzer'; // Import the new component
+import CodeChangeAnalyzer from './components/CodeChangeAnalyzer';
+import FigmaInputter from './components/FigmaInputter'; // <-- Import new component
 
 function App() {
   return (
@@ -12,13 +14,14 @@ function App() {
         <h1>AI-Integrated Test Case Management System (Prototype)</h1>
       </header>
       <main>
-        {/* Each component is wrapped in a div for consistent spacing/styling */}
         <TestCaseSuggester />
-
+        <hr /> {/* Add separator */}
+        <FigmaInputter /> {/* <-- Add the new component */}
+        <hr /> {/* Add separator */}
         <DefectAnalyzer />
-
+        <hr />
         <AutomationRecommender />
-
+        <hr />
         <CodeChangeAnalyzer />
       </main>
     </div>

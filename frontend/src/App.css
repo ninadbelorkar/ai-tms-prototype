@@ -161,3 +161,47 @@
     border-top: 1px solid #dee2e6; /* Slightly darker separator */
     margin: 40px 0;
   }
+
+  /* ... (existing styles) ... */
+
+.test-case-table {
+  width: 100%;
+  border-collapse: collapse; /* Remove double borders */
+  margin-top: 20px;
+  font-size: 0.9rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.test-case-table th,
+.test-case-table td {
+  border: 1px solid #ddd; /* Light grey borders */
+  padding: 10px 12px; /* Padding for cells */
+  text-align: left; /* Align text to the left */
+  vertical-align: top; /* Align content to the top of the cell */
+}
+
+.test-case-table th {
+  background-color: #007bff; /* Header background - match button */
+  color: white;
+  font-weight: 600;
+  position: sticky; /* Make header sticky if table scrolls */
+  top: 0;
+  z-index: 1;
+}
+
+.test-case-table tbody tr:nth-child(even) {
+  background-color: #f9f9f9; /* Zebra striping for rows */
+}
+
+.test-case-table tbody tr:hover {
+  background-color: #f1f1f1; /* Highlight on hover */
+}
+
+/* Style for ordered lists within table cells (for test steps) */
+.test-case-table td ol {
+  margin: 0;
+  padding-left: 18px; /* Indent list items */
+}
+.test-case-table td ol li {
+  margin-bottom: 4px; /* Spacing between list items */
+}

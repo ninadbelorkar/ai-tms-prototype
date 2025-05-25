@@ -5,7 +5,7 @@ import TestCaseSuggester from './components/TestCaseSuggester';
 import DefectAnalyzer from './components/DefectAnalyzer';
 import AutomationRecommender from './components/AutomationRecommender';
 import CodeChangeAnalyzer from './components/CodeChangeAnalyzer';
-import FigmaInputter from './components/FigmaInputter'; // <-- Import new component
+// import FigmaInputter from './components/FigmaInputter'; 
 
 function App() {
   return (
@@ -15,8 +15,6 @@ function App() {
       </header>
       <main>
         <TestCaseSuggester />
-        <hr /> {/* Add separator */}
-        <FigmaInputter /> {/* <-- Add the new component */}
         <hr /> {/* Add separator */}
         <DefectAnalyzer />
         <hr />

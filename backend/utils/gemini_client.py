@@ -29,7 +29,7 @@ DEFAULT_GENERATION_CONFIG = {
     "temperature": 0.7, # Lower temperature -> more deterministic; Higher -> more creative/random
     "top_p": 0.95,
     "top_k": 40, # Limits the sampling pool
-    "max_output_tokens": 1024, # Max length of the response
+    "max_output_tokens": 8000, # Max length of the response
 }
 
 # Safety settings - adjust thresholds as needed (BLOCK_NONE, BLOCK_LOW_AND_ABOVE, BLOCK_MEDIUM_AND_ABOVE, BLOCK_ONLY_HIGH)

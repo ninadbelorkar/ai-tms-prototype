@@ -1,4 +1,7 @@
 import React, { useState, useRef } from 'react';
+import { FaCopy } from 'react-icons/fa'; // For copy button
+import { copyToClipboard } from '../utils/clipboardUtils'; // Assuming utils/clipboardUtils.js exists
+import * as XLSX from 'xlsx'; // For Excel export
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:5001';
 
@@ -7,13 +10,14 @@ function TestCaseSuggester() {
     const [requirementsText, setRequirementsText] = useState('');
     const [selectedFile, setSelectedFile] = useState(null);
     const [figmaUrl, setFigmaUrl] = useState('');
-    const [figmaToken, setFigmaToken] = useState(''); // Consider secure storage for real apps
+    const [figmaToken, setFigmaToken] = useState('');
 
     const [suggestions, setSuggestions] = useState(null);
     const [isRawText, setIsRawText] = useState(false);
     const [sourceInfo, setSourceInfo] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState('');
+    const [copyStatus, setCopyStatus] = useState(''); // For copy feedback
 
     const fileInputRef = useRef(null);
 
@@ -25,12 +29,13 @@ function TestCaseSuggester() {
         }
         if (exceptType !== 'figma') {
             setFigmaUrl('');
-            // setFigmaToken(''); // Decide if token should reset on type change
+            // setFigmaToken(''); // Keeping token might be user-friendly if switching back and forth
         }
         setSuggestions(null);
         setIsRawText(false);
         setError('');
         setSourceInfo('');
+        setCopyStatus(''); // Reset copy status
     };
 
     const handleInputTypeChange = (type) => {
@@ -63,7 +68,7 @@ function TestCaseSuggester() {
         if (inputType === 'figma' && figmaUrl.trim() && figmaToken.trim()) isValidInput = true;
 
         if (!isValidInput) {
-            setError(`Please provide input for the selected type (${inputType}). Token is also required for Figma.`);
+            setError(`Please provide input for the selected type (${inputType}). ${inputType === 'figma' ? 'Token is also required for Figma.' : ''}`);
             return;
         }
 
@@ -72,6 +77,7 @@ function TestCaseSuggester() {
         setSuggestions(null);
         setIsRawText(false);
         setSourceInfo('');
+        setCopyStatus('');
 
         try {
             let response;
@@ -85,7 +91,6 @@ function TestCaseSuggester() {
                 const formData = new FormData();
                 formData.append('file', selectedFile);
                 body = formData;
-                // For FormData, browser sets Content-Type automatically
                 currentSourceInfo = `Suggestions based on uploaded file: ${selectedFile.name}`;
             } else if (inputType === 'text') {
                 endpoint = `${BACKEND_URL}/api/suggest-test-cases`;
@@ -96,17 +101,17 @@ function TestCaseSuggester() {
                 endpoint = `${BACKEND_URL}/api/suggest-test-cases-from-figma`;
                 body = JSON.stringify({ figma_url: figmaUrl, figma_token: figmaToken });
                 headers['Content-Type'] = 'application/json';
-                currentSourceInfo = `Suggestions based on Figma URL: ${figmaUrl.split('/').pop() || 'Figma Design'}`;
+                currentSourceInfo = `Suggestions based on Figma URL: ${figmaUrl.split('/').pop().split('?')[0] || 'Figma Design'}`;
             }
 
             response = await fetch(endpoint, {
                 method: 'POST',
-                headers: headers, // Will be empty for FormData, which is correct
+                headers: headers,
                 body: body,
             });
 
             const data = await response.json();
-            setSourceInfo(currentSourceInfo); // Set source info after fetch attempt
+            setSourceInfo(currentSourceInfo);
 
             if (!response.ok) {
                 throw new Error(data.error || `HTTP error! Status: ${response.status}`);
@@ -115,7 +120,7 @@ function TestCaseSuggester() {
             if (data.warning && typeof data.suggestions === 'string') {
                 setSuggestions(data.suggestions);
                 setIsRawText(true);
-                setError(data.warning); // Display backend warning as an error/info
+                setError(data.warning);
             } else if (Array.isArray(data.suggestions)) {
                 setSuggestions(data.suggestions);
                 setIsRawText(false);
@@ -132,6 +137,57 @@ function TestCaseSuggester() {
         } finally {
             setIsLoading(false);
         }
+    };
+
+    const handleCopyOutput = () => {
+        let textToCopy = "";
+        if (isRawText || typeof suggestions === 'string') {
+            textToCopy = suggestions;
+        } else if (Array.isArray(suggestions)) {
+            textToCopy = `AI Test Case Suggestions (${sourceInfo}):\n\n`;
+            suggestions.forEach(tc => {
+                textToCopy += `ID: ${tc.id || 'N/A'}\n`;
+                textToCopy += `Scenario: ${tc.scenario || 'N/A'}\n`;
+                textToCopy += `Summary: ${tc.test_case_summary || 'N/A'}\n`;
+                textToCopy += `Pre-condition: ${tc.pre_condition || 'N/A'}\n`;
+                textToCopy += `Test Steps:\n${Array.isArray(tc.test_steps) ? tc.test_steps.map(s => `  - ${s}`).join('\n') : (tc.test_steps || 'N/A')}\n`;
+                textToCopy += `Test Data: ${Array.isArray(tc.test_data) ? tc.test_data.join(', ') : (tc.test_data || 'N/A')}\n`;
+                textToCopy += `Expected Result: ${tc.expected_result || 'N/A'}\n\n`;
+            });
+        }
+
+        if (textToCopy) {
+            copyToClipboard(
+                textToCopy,
+                () => { setCopyStatus("Copied!"); setTimeout(() => setCopyStatus(''), 2000); },
+                (err) => { setCopyStatus(`Error: ${err}`); setTimeout(() => setCopyStatus(''), 3000); }
+            );
+        } else {
+            setCopyStatus("Nothing to copy.");
+            setTimeout(() => setCopyStatus(''), 2000);
+        }
+    };
+
+    const handleExportToExcel = () => {
+        if (isRawText || !Array.isArray(suggestions) || suggestions.length === 0) {
+            alert("No structured data available to export to Excel.");
+            return;
+        }
+        const dataForExcel = suggestions.map(tc => ({
+            'ID': tc.id || '',
+            'Scenario': tc.scenario || '',
+            'Test Case Summary': tc.test_case_summary || '',
+            'Pre-condition': tc.pre_condition || '',
+            'Test Steps': Array.isArray(tc.test_steps) ? tc.test_steps.join('\n') : (tc.test_steps || ''),
+            'Test Data': Array.isArray(tc.test_data) ? tc.test_data.join('\n') : (tc.test_data || ''),
+            'Expected Result': tc.expected_result || '',
+        }));
+        const worksheet = XLSX.utils.json_to_sheet(dataForExcel);
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, worksheet, "Test Cases");
+        const colWidths = [ {wch:15}, {wch:30}, {wch:50}, {wch:40}, {wch:60}, {wch:40}, {wch:50} ];
+        worksheet["!cols"] = colWidths;
+        XLSX.writeFile(workbook, "AI_Generated_Test_Cases.xlsx");
     };
 
     const renderTestSteps = (steps) => {
@@ -206,7 +262,7 @@ function TestCaseSuggester() {
                         <div className="form-group">
                             <label htmlFor="figmaToken">Figma Personal Access Token:</label>
                             <input
-                                type="password" // Use password type for tokens
+                                type="password"
                                 id="figmaToken"
                                 value={figmaToken}
                                 onChange={(e) => setFigmaToken(e.target.value)}
@@ -215,7 +271,7 @@ function TestCaseSuggester() {
                                 required
                             />
                              <small style={{display: 'block', marginTop: '5px'}}>
-                                Note: For security, tokens should ideally be handled more securely in a real application (e.g., backend proxy, user-specific storage).
+                                Note: For security, tokens should ideally be handled more securely.
                             </small>
                         </div>
                     </>
@@ -231,7 +287,19 @@ function TestCaseSuggester() {
 
             {suggestions && !isLoading && (
                 <div className="results">
-                    <h3>AI Suggestions</h3>
+                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                        <h3>AI Suggestions</h3>
+                        <div>
+                            <button onClick={handleCopyOutput} className="copy-button" title="Copy Output" style={{ marginRight: '10px' }}>
+                                <FaCopy /> {copyStatus || 'Copy'}
+                            </button>
+                            {!isRawText && Array.isArray(suggestions) && suggestions.length > 0 && (
+                                <button onClick={handleExportToExcel} className="export-button" title="Export to Excel">
+                                    Export to Excel
+                                </button>
+                            )}
+                        </div>
+                    </div>
                     {sourceInfo && <p style={{ fontSize: '0.9em', fontStyle: 'italic', marginBottom: '10px' }}>{sourceInfo}</p>}
 
                     {isRawText ? (

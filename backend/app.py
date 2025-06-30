@@ -9,6 +9,7 @@ import os
 import json # <<<<<<<<<<< ENSURED THIS IMPORT IS PRESENT
 from werkzeug.utils import secure_filename
 import re # Will use for robust cleaning
+from utils.image_parser import process_zip_file_for_images
 
 # Import utility functions
 from utils.gemini_client import generate_text
@@ -23,7 +24,7 @@ app.logger.setLevel(logging.INFO)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # --- Configuration ---
-UPLOAD_ALLOWED_EXTENSIONS = {'pdf', 'docx'}
+UPLOAD_ALLOWED_EXTENSIONS = {'pdf', 'docx', 'zip'}
 MAX_AI_INPUT_CHARS = 18000
 
 # --- Helper Functions (from your original) ---
@@ -61,27 +62,72 @@ def _clean_ai_response_for_json(ai_response_text: str) -> str:
 
 
 def _generate_json_test_case_prompt(content_source_description: str, extracted_content: str, is_figma: bool = False) -> str:
-    """Helper to create the standardized JSON prompt for test cases (returns an array of test cases)."""
+    """
+    MODIFIED Helper to create a more detailed and structured JSON prompt for test cases.
+    It now groups test cases by scenario and is more demanding about depth.
+    """
     specialized_intro = "specializing in UI/UX testing" if is_figma else ""
-    specialized_focus = "Focus on interactions, visual elements implied by text, navigation, and potential edge cases or missing states suggested by the structure." if is_figma else "Identify requirements, features, or user actions described. Cover positive/negative scenarios, boundary values, and edge cases based *only* on the text."
-    test_case_type_name = "UI/UX Test Cases" if is_figma else "Test Cases"
-    return f"""
-    Act as an expert Software Quality Assurance Engineer {specialized_intro}.
-    Analyze the following content extracted from '{content_source_description}' and generate detailed test cases.
-    For each test case, provide the following details as key-value pairs: "id" (a unique short identifier like TC-XX-01), "scenario" (a general area, e.g., 'User Login' or 'UI Element: Button'), "test_case_summary" (a concise description of what is being tested), "pre_condition" (what needs to be true before starting), "test_steps" (as an array of strings describing actions), "test_data" (as an array of strings, where each string is a data point like "Key: Value"), and "expected_result" (what should happen).
-    Return the output strictly as a JSON array, where each element is an object representing a single test case.
-    Do NOT include any introductory text, concluding text, or markdown formatting (like ```json) outside of the JSON array itself. Just the raw JSON array.
+    specialized_focus = "Focus on interactions, visual elements, navigation, and edge cases." if is_figma else "Identify requirements, features, and user actions. Cover all positive, negative, and boundary conditions."
+    test_case_type_name = "UI/UX Test Scenarios" if is_figma else "Test Scenarios"
 
-    Example of a single test case object structure:
-    {{
-      "id": "TC-LOGIN-01",
-      "scenario": "User Login Functionality",
-      "test_case_summary": "Verify successful login with valid credentials.",
-      "pre_condition": "User has a valid account. Application login page is accessible.",
-      "test_steps": ["Navigate to login page.", "Enter valid username.", "Enter valid password.", "Click 'Login' button."],
-      "test_data": ["Username: testuser@example.com", "Password: ValidPassword123"],
-      "expected_result": "User is successfully logged in and redirected to the dashboard."
-    }}
+    return f"""
+    Act as an expert and extremely detail-oriented Software Quality Assurance Engineer {specialized_intro}.
+    Your task is to dissect the requirements from '{content_source_description}' and create an exhaustive set of IN-DEPTH test cases. Do not provide high-level or general test cases. Each test case must be a specific, executable action.
+
+    For each functional area or feature you identify, create a "scenario" object. Each scenario object must contain:
+    - "scenario_title": (string) The name of the feature or area being tested (e.g., "Book Management: Add New Book").
+    - "positive_test_cases": (array of objects) Must include happy path, and tests for all optional fields or alternative valid inputs. Be thorough.
+    - "negative_test_cases": (array of objects) Must include tests for each validation rule mentioned, invalid data types, boundary conditions (min/max/empty values), and error handling. Be thorough.
+
+    Each individual test case object (within the positive and negative arrays) must have the following keys:
+    - "id": (string) A unique identifier like TC-ADD-POS-01.
+    - "test_case_summary": (string) Be very specific. Instead of "Test login", use "Test login with valid username and valid password".
+    - "test_steps": (array of strings) Provide clear, discrete user actions.
+    - "test_data": (array of strings) Provide concrete example data. For a negative test, provide the specific data that causes the failure.
+    - "expected_result": (string) The specific expected outcome.
+    - "priority": (string, one of: "P1", "P2", "P3") - P1 being highest.
+    - "severity": (string, one of: "High", "Medium", "Low") - High being most critical failure.
+
+    Return the output strictly as a JSON array of these "scenario" objects. Do not include any introductory text, concluding text, or markdown formatting (like ```json) outside of the JSON array itself.
+
+    Example of the required detail and structure:
+    [
+      {{
+        "scenario_title": "Book Management: Add New Book",
+        "positive_test_cases": [
+          {{
+            "id": "TC-ADD-POS-01",
+            "test_case_summary": "Add a new book with all valid data, including all optional fields.",
+            "test_steps": ["Navigate to 'Add Book'", "Fill all fields with valid data including optional notes", "Click Save"],
+            "test_data": ["ISBN: 9780123456789", "Title: A Valid Book", "Notes: First edition copy."],
+            "expected_result": "Success message is shown. Book appears in inventory with all data saved correctly.",
+            "priority": "P1",
+            "severity": "High"
+          }}
+        ],
+        "negative_test_cases": [
+          {{
+            "id": "TC-ADD-NEG-01",
+            "test_case_summary": "Attempt to add a book with a duplicate ISBN.",
+            "test_steps": ["Navigate to 'Add Book'", "Enter an ISBN that already exists in the system", "Fill other fields", "Click Save"],
+            "test_data": ["ISBN: 9780000000001 (known duplicate)"],
+            "expected_result": "An inline error message 'ISBN already exists' is displayed. The form is not submitted.",
+            "priority": "P1",
+            "severity": "High"
+          }},
+          {{
+            "id": "TC-ADD-NEG-02",
+            "test_case_summary": "Attempt to add a book with an empty required 'Title' field.",
+            "test_steps": ["Navigate to 'Add Book'", "Leave the 'Title' field empty", "Fill other required fields", "Click Save"],
+            "test_data": ["Title: (empty)"],
+            "expected_result": "A validation error message appears next to the 'Title' field, indicating it cannot be empty.",
+            "priority": "P1",
+            "severity": "Medium"
+          }}
+        ]
+      }}
+    ]
+
     {specialized_focus}
 
     Extracted Content:
@@ -156,10 +202,128 @@ def _handle_ai_json_object_response(ai_response_text: str, source_description: s
 
 # --- API Endpoints ---
 
+
+#This endpoint will receive a list of existing test cases and return a list of IDs for those that should be automated
+@app.route('/api/analyze-for-automation', methods=['POST'])
+def analyze_for_automation_endpoint():
+    """
+    Analyzes a list of test cases and suggests which are good candidates for automation.
+    Expects JSON: { "test_cases": [ { "id": "...", "test_case_summary": "...", "test_steps": [...] }, ... ] }
+    """
+    app.logger.info("Received request for /api/analyze-for-automation")
+    data = request.get_json()
+
+    if not data or 'test_cases' not in data or not isinstance(data['test_cases'], list) or len(data['test_cases']) == 0:
+        return create_response(error="Request must include a non-empty 'test_cases' array.", status_code=400)
+
+    # Convert the test cases list to a simplified string format for the prompt
+    # This is more token-efficient than sending the full JSON
+    test_cases_text = ""
+    for tc in data['test_cases']:
+        test_cases_text += f"ID: {tc.get('id', 'N/A')}\n"
+        test_cases_text += f"Summary: {tc.get('test_case_summary', 'N/A')}\n"
+        steps_str = " -> ".join(tc.get('test_steps', []))
+        test_cases_text += f"Steps: {steps_str}\n---\n"
+    
+    test_cases_text = truncate_text(test_cases_text, MAX_AI_INPUT_CHARS)
+
+    prompt = f"""
+    Act as an expert Test Automation Strategist.
+    Review the following list of test cases. Based on the summary and steps, identify the best candidates for automation. Good candidates are repetitive, test stable core functionality, are data-driven, or check critical paths. Bad candidates are exploratory, require human visual checks, or test highly unstable features.
+
+    Return a single JSON object with one key: "automated_test_case_ids". The value should be an array of strings, containing only the IDs of the test cases you recommend for automation.
+    Do NOT include any explanation or text outside the JSON object.
+
+    Example JSON output:
+    {{
+      "automated_test_case_ids": ["TC-BM-01-01", "TC-BM-02-01", "TC-CO-01"]
+    }}
+
+    List of Test Cases to Analyze:
+    ---
+    {test_cases_text}
+    ---
+    JSON Automation Candidates:
+    """
+    try:
+        ai_response_text = generate_text([prompt]) # Pass as list
+        # We expect a single JSON object, so use the object handler
+        # The result will be under the key "automation_analysis"
+        return _handle_ai_json_object_response(ai_response_text, "Automation Candidate Analysis", "automation_analysis")
+    except Exception as e:
+        app.logger.error(f"Error during GenAI call for automation analysis: {e}", exc_info=True)
+        return create_response(error="Failed to generate automation analysis.", status_code=500)
+
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     app.logger.info("Health check endpoint called.")
     return create_response({"status": "Backend is running"})
+
+
+@app.route('/api/suggest-test-cases-from-images', methods=['POST'])
+def suggest_test_cases_from_images_endpoint():
+    """
+    Analyzes a ZIP of UI images and suggests test cases.
+    EXPECTS A FLAT LIST OF TEST CASES, NOT NESTED SCENARIOS.
+    """
+    app.logger.info("Received request for /api/suggest-test-cases-from-images")
+    if 'file' not in request.files:
+        return create_response(error="No file part in request", status_code=400)
+    
+    file = request.files['file']
+    if file.filename == '':
+        return create_response(error="No selected file", status_code=400)
+    
+    if file and get_file_extension(file.filename) == 'zip':
+        original_filename = secure_filename(file.filename)
+        source_description = f"Image ZIP: {original_filename}"
+        
+        try:
+            images_data = process_zip_file_for_images(file.stream)
+            if not images_data:
+                return create_response(error="No supported images (PNG/JPG) found in the ZIP file.", status_code=400)
+            app.logger.info(f"Extracted {len(images_data)} images from ZIP file.")
+            
+            # --- NEW, SIMPLER PROMPT SPECIFICALLY FOR IMAGES (WITH "type") ---
+            prompt_text = """
+            Act as an expert Software Quality Assurance Engineer specializing in UI/UX testing.
+            Analyze the following user interface screenshots. Based on the visual elements, layout, and text visible in these images, generate a flat list of detailed test cases.
+
+            For each test case, provide the following details as key-value pairs:
+            - "id": (string) A unique identifier like TC-UI-01.
+            - "scenario": (string) The name of the screen or component being tested (e.g., "Login Screen", "Contact Form").
+            - "type": (string, one of: "Positive" or "Negative") The nature of the test. "Positive" for happy paths, "Negative" for error conditions or invalid inputs.
+            - "test_case_summary": (string) A concise description of the specific test.
+            - "test_steps": (array of strings) The actions to perform.
+            - "test_data": (array of strings) Example data used, if any.
+            - "expected_result": (string) The expected visual or functional outcome.
+            - "priority": (string, one of: "P1", "P2", "P3").
+            - "severity": (string, one of: "High", "Medium", "Low").
+
+            Return the output strictly as a single JSON array of these test case objects. Do NOT include any text outside the JSON array.
+            """ 
+
+            prompt_parts = [prompt_text]
+            for img_data in images_data:
+                prompt_parts.append(f"Analyzing image: {img_data['filename']}")
+                prompt_parts.append(img_data['image'])
+            
+            ai_response_text = generate_text(prompt_parts)
+            
+            # Use the existing helper that expects an array of test cases
+            return _handle_ai_json_array_response(ai_response_text, source_description)
+            
+        except (ValueError, IOError) as e:
+            app.logger.error(f"Error processing ZIP file {original_filename}: {e}")
+            return create_response(error=str(e), status_code=400)
+        except Exception as e:
+            app.logger.error(f"Unexpected error processing image ZIP: {e}", exc_info=True)
+            return create_response(error="An internal server error occurred while processing the images.", status_code=500)
+    else:
+        return create_response(error="File type not allowed. Please upload a ZIP file.", status_code=400)
+
 
 # --- Test Case Suggestion Endpoints (MODIFIED TO USE JSON HANDLERS) ---
 

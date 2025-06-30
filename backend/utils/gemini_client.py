@@ -58,26 +58,25 @@ except Exception as e:
 
 # --- Core Function ---
 
-def generate_text(prompt_text: str) -> str:
+def generate_text(prompt_parts: list) -> str:
     """
-    Sends a prompt to the configured Gemini model and returns the generated text.
+    Sends a prompt (text and/or images) to the Gemini model and returns the generated text.
 
     Args:
-        prompt_text: The input prompt string for the model.
+        prompt_parts: A list containing text strings and/or PIL.Image objects.
 
     Returns:
-        The generated text content as a string, or an error message string
-        if generation fails or the response is blocked/empty.
+        The generated text content as a string, or an error message.
     """
-    if not prompt_text:
-        logging.warning("generate_text called with empty prompt.")
+
+    if not prompt_parts:
+        logging.warning("generate_text called with empty prompt parts.")
         return "Error: Prompt cannot be empty."
 
     try:
-        logging.info(f"Sending prompt to Gemini ({MODEL_NAME})...")
-        # Sending the prompt as a simple string often works for basic models
-        response = model.generate_content(prompt_text)
-        logging.info(f"Received response from Gemini.")
+        logging.info(f"Sending prompt to Gemini multimodal model ({MODEL_NAME})...")
+        response = model.generate_content(prompt_parts)
+        # logging.info(f"Received response from Gemini.")
 
         # --- Response Handling ---
         # Accessing response text - check Gemini API documentation for the most current structure
@@ -86,12 +85,8 @@ def generate_text(prompt_text: str) -> str:
             return response.text
 
         # Fallback: Check candidates if .text isn't directly available or empty
-        elif response.candidates:
-            # Typically, the first candidate is the primary one
-            candidate = response.candidates[0]
-            if candidate.content and candidate.content.parts:
-                # Concatenate parts if there are multiple
-                return "".join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
+        elif response.candidates and response.candidates[0].content.parts:
+            return "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
 
         # Handle cases where the response might be blocked due to safety settings or other issues
         # Check the prompt_feedback attribute if available
@@ -108,9 +103,9 @@ def generate_text(prompt_text: str) -> str:
 
     except Exception as e:
         # Catch potential API errors, network issues, etc.
-        logging.error(f"Error during Gemini API call: {e}", exc_info=True) # Log stack trace
+        logging.error(f"Error calling Google GenAI: {e}", exc_info=True) # Log stack trace
         # Consider checking for specific exception types from the google-generativeai library
-        return f"Error: An exception occurred during content generation: {e}"
+        return f"Error: Failed to generate content due to: {e}"
 
 # --- Example Usage (for testing this module directly) ---
 if __name__ == "__main__":

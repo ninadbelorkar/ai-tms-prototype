@@ -6,3 +6,4 @@ google-generativeai>=0.3 # Google AI Python SDK
 PyPDF2>=3.0.0
 python-docx>=1.1.0 # For DOCX parsing
 requests>=2.20.0 # For making HTTP API calls
+Pillow

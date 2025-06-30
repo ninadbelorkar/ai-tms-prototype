@@ -328,3 +328,91 @@ hr {
 .copy-button .icon, .export-button .icon { /* If you add icons to export button */
   margin-right: 5px;
 }
+
+/* Highlight for automation candidates */
+.test-case-table tbody tr.automated-candidate {
+  background-color: #e6f7ff; /* A light blue highlight */
+  /* Or use a border */
+  /* border-left: 5px solid #1890ff; */
+}
+
+.test-case-table tbody tr.automated-candidate:hover {
+    background-color: #d9f2ff;
+}
+
+/* Style for the star icon */
+.test-case-table td .icon {
+  color: #ffc107; /* Gold color for the star */
+  margin-right: 5px;
+  vertical-align: middle;
+}
+
+/* --- Specific Styles for Action Buttons in Results Header --- */
+.results-action-button {
+  background-color: #007bff;
+  color: white;
+  border: none;
+  padding: 8px 16px; /* Smaller padding for a more compact look */
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.9rem; /* Slightly smaller font */
+  font-weight: 500;
+  transition: background-color 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.results-action-button:hover:not(:disabled) {
+  background-color: #0056b3;
+}
+
+.results-action-button:disabled {
+  background-color: #a0cfff;
+  cursor: not-allowed;
+}
+
+/* Align icon inside the button */
+.results-action-button svg {
+    margin-right: 6px;
+}
+
+.scenarios-container {
+    margin-top: 20px;
+}
+
+.scenario-block {
+    background-color: #fff;
+    border: 1px solid #e9ecef;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 25px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+
+.scenario-block h3 {
+    font-size: 1.3rem;
+    color: #0056b3; /* Darker blue for scenario titles */
+    margin-top: 0;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #dee2e6;
+}
+
+.table-type-header {
+    font-size: 1.1rem;
+    margin-top: 20px;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+}
+
+.table-type-header.type-positive {
+    color: #28a745; /* Green for positive */
+}
+.table-type-header.type-negative {
+    color: #dc3545; /* Red for negative */
+}
+
+.table-type-header .icon {
+    margin-right: 8px;
+}

@@ -1,12 +1,7 @@
-# File: .gitignore (Place in the root ai-tms-project/ directory)
-
-# --- Environment Variables ---
-# Never commit your secrets!
 backend/.env
 
-# --- Python / Flask Backend ---
-# Byte-compiled / optimized / DLL files
-backend/__pycache__/
+__pycache__/  # <--- ADDED: Ignores any Python cache directory
+backend/__pycache__/ # This is also good for specificity
 backend/*.py[cod]
 backend/*$py.class
 
@@ -33,9 +28,6 @@ backend/.installed.cfg
 backend/*.egg
 backend/MANIFEST
 
-# PyInstaller
-# Usually these files are written by a python script from a template
-# before PyInstaller builds the exe, so as to inject date/other infos into it.
 backend/*.manifest
 backend/*.spec
 
@@ -63,18 +55,11 @@ backend/junit/
 backend/*.mo
 backend/*.pot
 
-# Django stuff:
-# backend/*.log
-# backend/local_settings.py
-# backend/db.sqlite3
-# backend/db.sqlite3-journal
 
 # Flask stuff:
 backend/instance/ # Default Flask instance folder
 backend/.webassets-cache
 
-# Scrapy stuff:
-# backend/.scrapy
 
 # Virtual environments
 backend/venv/

@@ -5,6 +5,7 @@ import TestCaseSuggester from './components/TestCaseSuggester';
 import DefectAnalyzer from './components/DefectAnalyzer';
 import AutomationRecommender from './components/AutomationRecommender';
 import CodeChangeAnalyzer from './components/CodeChangeAnalyzer';
+import Dashboard from './components/Dashboard';
 // import FigmaInputter from './components/FigmaInputter'; 
 
 function App() {
@@ -14,6 +15,8 @@ function App() {
         <h1>AI-Integrated Test Case Management System (Prototype)</h1>
       </header>
       <main>
+        <Dashboard />
+        <hr />
         <TestCaseSuggester />
         <hr /> {/* Add separator */}
         <DefectAnalyzer />

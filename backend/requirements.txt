@@ -1,9 +1,11 @@
-Flask>=2.0          # Web framework
-Flask-Cors>=3.0     # Handles Cross-Origin Resource Sharing (allows frontend to call backend)
-python-dotenv>=0.19 # Reads environment variables from the .env file
-google-generativeai>=0.3 # Google AI Python SDK
+Flask>=2.0
+Flask-Cors>=3.0
+python-dotenv>=0.19
+google-generativeai>=0.3
 # PyMuPDF>=1.23.0   # For PDF parsing (fitz)
 PyPDF2>=3.0.0
-python-docx>=1.1.0 # For DOCX parsing
-requests>=2.20.0 # For making HTTP API calls
+python-docx>=1.1.0
+requests>=2.20.0
 Pillow
+Flask-Script
+mongoengine

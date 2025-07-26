@@ -1,23 +1,21 @@
-// File: frontend/src/components/TestCaseSuggester.js (FINAL VERSION with all features and fixes)
+// File: frontend/src/components/TestCaseSuggester.js (FINAL, COMPLETE, AND CORRECTED)
 
 import React, { useState, useRef } from 'react';
-import { FaCopy, FaStar, FaFileExcel, FaPlusCircle, FaMinusCircle } from 'react-icons/fa';
+import { FaCopy, FaStar, FaFileExcel, FaPlusCircle, FaMinusCircle, FaEdit, FaSave, FaTimes, FaTrash } from 'react-icons/fa';
 import { copyToClipboard } from '../utils/clipboardUtils'; 
 import * as XLSX from 'xlsx';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:5001';
 
-// Helper function to check if data is the new nested structure (has scenario_title)
+// --- HELPER FUNCTIONS (defined outside components for global scope within this file) ---
+
 const isNestedStructure = (data) => {
     return Array.isArray(data) && data.length > 0 && data[0] && data[0].hasOwnProperty('scenario_title');
 };
 
-// NEW: Groups a flat list of test cases (like from the image endpoint) into the nested scenario structure
 const groupTcsByScenario = (flatTcs) => {
     if (!flatTcs || !Array.isArray(flatTcs)) return [];
-
-    const scenarios = {}; // Use an object for efficient grouping
-
+    const scenarios = {};
     flatTcs.forEach(tc => {
         const scenarioTitle = tc.scenario || "Uncategorized";
         if (!scenarios[scenarioTitle]) {
@@ -27,27 +25,127 @@ const groupTcsByScenario = (flatTcs) => {
                 negative_test_cases: [],
             };
         }
-
         if (tc.type && tc.type.toLowerCase() === 'negative') {
             scenarios[scenarioTitle].negative_test_cases.push(tc);
         } else {
-            // Default to positive if type is missing or not 'Negative'
             scenarios[scenarioTitle].positive_test_cases.push(tc);
         }
     });
+    return Object.values(scenarios);
+};
 
-    return Object.values(scenarios); // Convert the scenarios object back to an array
+const renderTestSteps = (steps, isForText = false) => {
+    if (!Array.isArray(steps)) return steps || '';
+    if (isForText) return steps.map(s => `  - ${s}`).join('\n');
+    return <ol style={{ margin: 0, paddingLeft: '20px', listStyleType: 'decimal' }}>{steps.map((step, index) => <li key={index}>{step}</li>)}</ol>;
+};
+
+const renderTestData = (testData) => {
+    if (Array.isArray(testData)) return testData.join('\n');
+    if (typeof testData === 'object' && testData !== null) return Object.entries(testData).map(([key, value]) => `${key}: ${value}`).join('\n');
+    return testData || '';
 };
 
 
+// --- SUB-COMPONENT: TestCaseTable (Moved outside for performance and focus fix) ---
+const TestCaseTable = ({ 
+    testCases, 
+    automatedTestCaseIds, 
+    editingRowId, 
+    editedRowData,
+    hoveredRowId,
+    setHoveredRowId,
+    handleEditClick,
+    handleSaveClick,
+    handleCancelClick,
+    handleEditChange,
+    handleEditStepsChange,
+    handleDeleteTestCase
+}) => {
+    if (!testCases || testCases.length === 0) return null;
+
+    return (
+        <div style={{ overflowX: 'auto' }}>
+            <table className="test-case-table">
+                <thead>
+                    <tr>
+                        <th style={{width: '15%'}}>ID</th>
+                        <th style={{width: '10%'}}>Priority</th>
+                        <th style={{width: '10%'}}>Severity</th>
+                        <th>Test Case Summary</th>
+                        <th>Test Steps</th>
+                        <th>Test Data</th>
+                        <th>Expected Result</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {testCases.map((tc) => {
+                        const isEditing = editingRowId === tc.id;
+                        const isAutomatedCandidate = automatedTestCaseIds.includes(tc.id);
+
+                        return isEditing ? (
+                            <tr key={tc.id} className="editing-row">
+                                <td>
+                                    <div>{editedRowData.case_id_string || editedRowData.id}</div>
+                                    <div className="edit-actions">
+                                        <button onClick={() => handleSaveClick(tc.id)} className="edit-action-btn save"><FaSave /> Save</button>
+                                        <button onClick={handleCancelClick} className="edit-action-btn cancel"><FaTimes /> Cancel</button>
+                                    </div>
+                                </td>
+                                <td><input value={editedRowData.priority || ''} onChange={(e) => handleEditChange(e, 'priority')} /></td>
+                                <td><input value={editedRowData.severity || ''} onChange={(e) => handleEditChange(e, 'severity')} /></td>
+                                <td><textarea value={editedRowData.summary || ''} onChange={(e) => handleEditChange(e, 'summary')} /></td>
+                                <td>
+                                    {Array.isArray(editedRowData.test_steps_json) && editedRowData.test_steps_json.map((step, i) => (
+                                        <textarea key={i} value={step} onChange={(e) => handleEditStepsChange(e, i)} />
+                                    ))}
+                                </td>
+                                <td><textarea value={editedRowData.test_data || ''} onChange={(e) => handleEditChange(e, 'test_data')} /></td>
+                                <td><textarea value={editedRowData.expected_result || ''} onChange={(e) => handleEditChange(e, 'expected_result')} /></td>
+                            </tr>
+                        ) : (
+                            <tr 
+                                key={tc.id} 
+                                className={isAutomatedCandidate ? 'automated-candidate' : ''}
+                                onMouseEnter={() => setHoveredRowId(tc.id)}
+                                onMouseLeave={() => setHoveredRowId(null)}
+                            >
+                                <td className="id-cell">
+                                    <div className="id-content">
+                                        {isAutomatedCandidate && <FaStar className="icon" title="Recommended for Automation" />}
+                                        {tc.case_id_string || tc.id}
+                                    </div>
+                                    {hoveredRowId === tc.id && (
+                                        <div className="hover-actions">
+                                            <button onClick={() => handleEditClick(tc)} className="edit-button-hover"><FaEdit /> Edit</button>
+                                            <button onClick={() => handleDeleteTestCase(tc.id)} className="delete-button-hover"><FaTrash /></button>
+                                        </div>
+                                    )}
+                                </td>
+                                <td>{tc.priority}</td>
+                                <td>{tc.severity}</td>
+                                <td>{tc.summary}</td>
+                                <td>{renderTestSteps(tc.test_steps_json)}</td>
+                                <td><pre style={{margin: 0, fontFamily: 'inherit'}}>{renderTestData(tc.test_data_json)}</pre></td>
+                                <td>{tc.expected_result}</td>
+                            </tr>
+                        );
+                    })}
+                </tbody>
+            </table>
+        </div>
+    );
+};
+
+
+// --- MAIN COMPONENT ---
 function TestCaseSuggester() {
-    // --- State Management (from your complete version) ---
+    // --- State Management ---
     const [inputType, setInputType] = useState('text');
     const [requirementsText, setRequirementsText] = useState('');
     const [selectedFile, setSelectedFile] = useState(null);
     const [figmaUrl, setFigmaUrl] = useState('');
     const [figmaToken, setFigmaToken] = useState('');
-    
     const [suggestions, setSuggestions] = useState(null); 
     const [automatedTestCaseIds, setAutomatedTestCaseIds] = useState([]);
     const [isRawText, setIsRawText] = useState(false);
@@ -56,19 +154,19 @@ function TestCaseSuggester() {
     const [isAnalyzingAutomation, setIsAnalyzingAutomation] = useState(false);
     const [error, setError] = useState('');
     const [copyStatus, setCopyStatus] = useState('');
-
     const fileInputRef = useRef(null);
+    const [editingRowId, setEditingRowId] = useState(null);
+    const [editedRowData, setEditedRowData] = useState({});
+    const [hoveredRowId, setHoveredRowId] = useState(null);
 
-    // --- Event Handlers (from your complete version) ---
+    // --- Event Handlers ---
     const resetInputs = (exceptType) => {
         if (exceptType !== 'text') setRequirementsText('');
         if (exceptType !== 'file' && exceptType !== 'image_zip') {
             setSelectedFile(null);
             if (fileInputRef.current) fileInputRef.current.value = '';
         }
-        if (exceptType !== 'figma') {
-            setFigmaUrl('');
-        }
+        if (exceptType !== 'figma') setFigmaUrl('');
         setSuggestions(null);
         setAutomatedTestCaseIds([]);
         setIsRawText(false);
@@ -151,17 +249,14 @@ function TestCaseSuggester() {
         }
     };
     
-    // NEW: Helper function to get a flat list of test cases, regardless of original structure
     const getFlattenedTcs = (suggestionsData) => {
         if (!suggestionsData || !Array.isArray(suggestionsData)) return [];
         if (isNestedStructure(suggestionsData)) {
-            // Flatten the nested structure and add scenario_title and type to each test case for context
             return suggestionsData.flatMap(scenario => [
                 ...(scenario.positive_test_cases || []).map(tc => ({ ...tc, scenario_title: scenario.scenario_title, type: 'Positive' })),
                 ...(scenario.negative_test_cases || []).map(tc => ({ ...tc, scenario_title: scenario.scenario_title, type: 'Negative' }))
             ]);
         }
-        // It's already a flat array (from image zip), but the AI should have added a 'type' property
         return suggestionsData;
     };
 
@@ -202,20 +297,19 @@ function TestCaseSuggester() {
             textToCopy = suggestions;
         } else if (Array.isArray(suggestions)) {
             textToCopy = `AI Test Case Suggestions (${sourceInfo}):\n\n`;
-            // Use the flattening helper for consistent output
             const allTestCases = getFlattenedTcs(suggestions);
             allTestCases.forEach(tc => {
                 const isCandidate = automatedTestCaseIds.includes(tc.id);
                 if (isCandidate) textToCopy += `** AUTOMATION CANDIDATE **\n`;
-                textToCopy += `ID: ${tc.id || 'N/A'}\n`;
+                textToCopy += `ID: ${tc.case_id_string || tc.id || 'N/A'}\n`;
                 textToCopy += `Scenario: ${tc.scenario_title || tc.scenario || 'N/A'}\n`;
                 if(tc.type) textToCopy += `Type: ${tc.type}\n`;
                 textToCopy += `Priority: ${tc.priority || 'N/A'}\n`;
                 textToCopy += `Severity: ${tc.severity || 'N/A'}\n`;
-                textToCopy += `Summary: ${tc.test_case_summary || 'N/A'}\n`;
+                textToCopy += `Summary: ${tc.summary || 'N/A'}\n`;
                 textToCopy += `Pre-condition: ${tc.pre_condition || 'N/A'}\n`;
-                textToCopy += `Test Steps:\n${renderTestSteps(tc.test_steps, true)}\n`;
-                textToCopy += `Test Data: ${renderTestData(tc.test_data)}\n`;
+                textToCopy += `Test Steps:\n${renderTestSteps(tc.test_steps_json, true)}\n`;
+                textToCopy += `Test Data: ${renderTestData(tc.test_data_json)}\n`;
                 textToCopy += `Expected Result: ${tc.expected_result || 'N/A'}\n\n`;
             });
         }
@@ -233,15 +327,15 @@ function TestCaseSuggester() {
             const isCandidate = automatedTestCaseIds.includes(tc.id);
             return {
                 'Automation Candidate': isCandidate ? 'Yes ⭐️' : 'No',
-                'ID': tc.id || '',
-                'Scenario': tc.scenario_title || tc.scenario || '', // Use scenario_title if it exists
+                'ID': tc.case_id_string || tc.id || '',
+                'Scenario': tc.scenario_title || tc.scenario || '',
                 'Type': tc.type || 'N/A',
                 'Priority': tc.priority || '',
                 'Severity': tc.severity || '',
-                'Test Case Summary': tc.test_case_summary || '',
+                'Test Case Summary': tc.summary || '',
                 'Pre-condition': tc.pre_condition || '',
-                'Test Steps': renderTestSteps(tc.test_steps, true),
-                'Test Data': renderTestData(tc.test_data),
+                'Test Steps': renderTestSteps(tc.test_steps_json, true),
+                'Test Data': renderTestData(tc.test_data_json),
                 'Expected Result': tc.expected_result || '',
             };
         });
@@ -252,64 +346,96 @@ function TestCaseSuggester() {
         XLSX.writeFile(workbook, "AI_Generated_Test_Cases.xlsx");
     };
 
-    const renderTestSteps = (steps, isForText = false) => {
-        if (!Array.isArray(steps)) return steps || '';
-        if (isForText) return steps.map(s => `  - ${s}`).join('\n');
-        return (
-            <ol style={{ margin: 0, paddingLeft: '20px', listStyleType: 'decimal' }}>
-                {steps.map((step, index) => <li key={index}>{step}</li>)}
-            </ol>
-        );
+    const handleEditClick = (testCase) => {
+        setEditingRowId(testCase.id);
+        setEditedRowData({ 
+            ...testCase,
+            test_data: renderTestData(testCase.test_data_json), 
+            test_steps_json: testCase.test_steps_json || [],
+        });
     };
 
-    const renderTestData = (testData) => {
-        if (Array.isArray(testData)) {
-            return testData.join('\n');
-        }
-        if (typeof testData === 'object' && testData !== null) {
-            return Object.entries(testData).map(([key, value]) => `${key}: ${value}`).join('\n');
-        }
-        return testData || '';
+    const handleCancelClick = () => {
+        setEditingRowId(null);
+        setEditedRowData({});
     };
 
-    const TestCaseTable = ({ testCases }) => {
-        if (!testCases || testCases.length === 0) return null;
-        return (
-            <div style={{ overflowX: 'auto' }}>
-                <table className="test-case-table">
-                    <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>Priority</th>
-                            <th>Severity</th>
-                            <th>Test Case Summary</th>
-                            <th>Test Steps</th>
-                            <th>Test Data</th>
-                            <th>Expected Result</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {testCases.map((tc, index) => {
-                            const isAutomatedCandidate = automatedTestCaseIds.includes(tc.id);
-                            return (
-                                <tr key={tc.id || `tc-flat-${index}`} className={isAutomatedCandidate ? 'automated-candidate' : ''}>
-                                    <td>
-                                        {isAutomatedCandidate && <FaStar className="icon" title="Recommended for Automation" />}
-                                        {tc.id}
-                                    </td>
-                                    <td>{tc.priority}</td>
-                                    <td>{tc.severity}</td>
-                                    <td>{tc.test_case_summary}</td>
-                                    <td>{renderTestSteps(tc.test_steps)}</td>
-                                    <td><pre style={{margin: 0, fontFamily: 'inherit'}}>{renderTestData(tc.test_data)}</pre></td>
-                                    <td>{tc.expected_result}</td>
-                                </tr>
-                            );
-                        })}
-                    </tbody>
-                </table>
-            </div>
-        );
+    const handleEditChange = (e, field) => {
+        setEditedRowData({ ...editedRowData, [field]: e.target.value });
+    };
+    
+    const handleEditStepsChange = (e, index) => {
+        const newSteps = [...editedRowData.test_steps_json];
+        newSteps[index] = e.target.value;
+        setEditedRowData({ ...editedRowData, test_steps_json: newSteps });
+    };
+
+
+    const handleDeleteTestCase = async (caseIdToDelete) => {
+        if (!window.confirm("Are you sure you want to permanently delete this test case?")) {
+            return;
+        }
+        try {
+            const response = await fetch(`${BACKEND_URL}/api/test-cases/${caseIdToDelete}`, {
+                method: 'DELETE',
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || "Failed to delete test case.");
+
+            // If successful, update the state to remove the item from the UI
+            const updateSuggestions = (currentSuggestions) => {
+                if (!currentSuggestions) return [];
+                const updater = (tc) => tc.id !== caseIdToDelete;
+
+                if (isNestedStructure(currentSuggestions)) {
+                    return currentSuggestions.map(scenario => ({
+                        ...scenario,
+                        positive_test_cases: (scenario.positive_test_cases || []).filter(updater),
+                        negative_test_cases: (scenario.negative_test_cases || []).filter(updater),
+                    })).filter(scenario => scenario.positive_test_cases.length > 0 || scenario.negative_test_cases.length > 0);
+                } else {
+                    return currentSuggestions.filter(updater);
+                }
+            };
+            setSuggestions(updateSuggestions(suggestions));
+
+        } catch (err) {
+            setError(err.message);
+        }
+    };
+
+
+    const handleSaveClick = async (caseId) => {
+        try {
+            const dataToSend = { ...editedRowData };
+            dataToSend.test_data_json = dataToSend.test_data;
+            
+            const response = await fetch(`${BACKEND_URL}/api/test-cases/${caseId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(dataToSend),
+            });
+            const updatedTestCase = await response.json();
+            if (!response.ok) throw new Error(updatedTestCase.error || "Failed to save changes.");
+
+            const updateSuggestions = (currentSuggestions) => {
+                if (!currentSuggestions) return [];
+                const updater = (tc) => tc.id === updatedTestCase.id ? updatedTestCase : tc;
+                if (isNestedStructure(currentSuggestions)) {
+                    return currentSuggestions.map(scenario => ({
+                        ...scenario,
+                        positive_test_cases: (scenario.positive_test_cases || []).map(updater),
+                        negative_test_cases: (scenario.negative_test_cases || []).map(updater),
+                    }));
+                } else {
+                    return currentSuggestions.map(updater);
+                }
+            };
+            setSuggestions(updateSuggestions(suggestions));
+            handleCancelClick();
+        } catch (err) {
+            setError(err.message);
+        }
     };
 
     return (
@@ -389,16 +515,24 @@ function TestCaseSuggester() {
                         </div>
                     </div>
                     {sourceInfo && <p style={{ fontSize: '0.9em', fontStyle: 'italic', marginBottom: '10px' }}>{sourceInfo}</p>}
-
+                    
                     {isRawText ? ( <pre>{suggestions}</pre> ) : (
                         <div className="scenarios-container">
                             {(isNestedStructure(suggestions) ? suggestions : groupTcsByScenario(suggestions)).map((scenario, index) => (
                                 <div key={index} className="scenario-block">
                                     <h3>{scenario.scenario_title}</h3>
                                     <h4 className="table-type-header type-positive"><FaPlusCircle className="icon" />Positive Test Cases</h4>
-                                    <TestCaseTable testCases={scenario.positive_test_cases} />
+                                    <TestCaseTable 
+                                        testCases={scenario.positive_test_cases}
+                                        handleDeleteTestCase={handleDeleteTestCase} 
+                                        {...{ editingRowId, editedRowData, hoveredRowId, setHoveredRowId, handleEditClick, handleSaveClick, handleCancelClick, handleEditChange, handleEditStepsChange, automatedTestCaseIds }}
+                                    />
                                     <h4 className="table-type-header type-negative"><FaMinusCircle className="icon" />Negative Test Cases</h4>
-                                    <TestCaseTable testCases={scenario.negative_test_cases} />
+                                    <TestCaseTable 
+                                        testCases={scenario.negative_test_cases}
+                                        handleDeleteTestCase={handleDeleteTestCase} 
+                                        {...{ editingRowId, editedRowData, hoveredRowId, setHoveredRowId, handleEditClick, handleSaveClick, handleCancelClick, handleEditChange, handleEditStepsChange, automatedTestCaseIds }}
+                                    />
                                 </div>
                             ))}
                         </div>

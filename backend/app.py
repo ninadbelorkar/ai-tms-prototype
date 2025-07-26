@@ -1,21 +1,18 @@
-# File: backend/app.py
-# STARTING FROM YOUR PROVIDED 418-LINE VERSION
-# CORRECTLY Integrating JSON output for ALL AI features.
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import logging
 import os
-import json # <<<<<<<<<<< ENSURED THIS IMPORT IS PRESENT
+import json
 from werkzeug.utils import secure_filename
-import re # Will use for robust cleaning
+import re
+from datetime import datetime, timezone
 from utils.image_parser import process_zip_file_for_images
-
-# Import utility functions
 from utils.gemini_client import generate_text
 from utils.file_parser import parse_pdf, parse_docx, get_file_extension
-# Assuming figma_client.py exists and has these functions:
 from utils.figma_client import extract_file_key_from_url, get_figma_file_content, process_figma_data
+from mongoengine import connect, Document, StringField, ListField, DateTimeField, DynamicField, IntField, ReferenceField
+from bson import ObjectId
+
 
 # --- Flask App Setup ---
 app = Flask(__name__)
@@ -26,6 +23,93 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 # --- Configuration ---
 UPLOAD_ALLOWED_EXTENSIONS = {'pdf', 'docx', 'zip'}
 MAX_AI_INPUT_CHARS = 18000
+
+
+# --- Database Configuration ---
+try:
+    connect(host=os.getenv('MONGODB_URI'))
+    app.logger.info("Successfully connected to MongoDB Atlas.")
+except Exception as e:
+    app.logger.error(f"Failed to connect to MongoDB Atlas: {e}", exc_info=True)
+
+
+class TestCaseGeneration(Document):
+    """Represents a single event of generating a batch of test cases."""
+    source_type = StringField(max_length=50) # e.g., 'Text Input', 'File: req.pdf', 'Image ZIP'
+    test_case_count = IntField(default=0)
+    created_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
+    
+    # This will store the DB IDs of the test cases created in this batch
+    test_case_ids = ListField(ReferenceField('TestCase'))
+
+    meta = {'collection': 'test_case_generations'}
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "source_type": self.source_type,
+            "test_case_count": self.test_case_count,
+            "created_at": self.created_at.isoformat()
+        }
+
+
+class TestCase(Document):
+    case_id_string = StringField(max_length=50) # e.g., TC-LOGIN-01
+    scenario = StringField(required=True, max_length=255)
+    summary = StringField(required=True)
+    pre_condition = StringField()
+    test_steps = ListField(StringField(), required=True)
+    test_data = DynamicField() # Can store string, list, or dict
+    expected_result = StringField()
+    priority = StringField(max_length=10)
+    severity = StringField(max_length=20)
+    created_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
+    
+    generation_event = ReferenceField('TestCaseGeneration')
+    # MongoEngine uses 'id' for the primary key (_id in the DB)
+    meta = {'collection': 'test_cases'}
+
+    def to_dict(self):
+        # Convert the document to a dictionary
+        data = self.to_mongo().to_dict()
+        # Convert the main ObjectId to a string for JSON serialization
+        data['id'] = str(data.pop('_id'))
+
+        # Convert the generation_event ObjectId to a string if it exists
+        if 'generation_event' in data and isinstance(data['generation_event'], ObjectId):
+            data['generation_event'] = str(data['generation_event'])
+
+        # Convert datetime to an ISO format string
+        if 'created_at' in data and isinstance(data['created_at'], datetime):
+            data['created_at'] = data['created_at'].isoformat()
+
+        # Match the frontend's expected keys
+        data['test_steps_json'] = data.pop('test_steps', [])
+        data['test_data_json'] = data.pop('test_data', None)
+         # The 'summary' field is already a string, so we just ensure test_case_summary exists too
+        data['summary'] = data.get('summary', '')
+        data['test_case_summary'] = data.get('summary', '')
+
+        return data
+
+class AiAnalysis(Document):
+    analysis_type = StringField(required=True, choices=['defect', 'automation', 'impact'])
+    source_info = StringField(max_length=255)
+    analysis_json = DynamicField(required=True) # The structured AI JSON response
+    created_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
+
+    meta = {'collection': 'ai_analyses'}
+
+    def to_dict(self):
+        data = self.to_mongo().to_dict()
+        data['id'] = str(data.pop('_id'))
+        if 'created_at' in data and isinstance(data['created_at'], datetime):
+            data['created_at'] = data['created_at'].isoformat()
+        
+        # Match frontend's expected key
+        data['analysis'] = data.pop('analysis_json', {})
+
+        return data
 
 # --- Helper Functions (from your original) ---
 def allowed_file(filename):
@@ -89,7 +173,9 @@ def _generate_json_test_case_prompt(content_source_description: str, extracted_c
     - "severity": (string, one of: "High", "Medium", "Low") - High being most critical failure.
 
     Return the output strictly as a JSON array of these "scenario" objects. Do not include any introductory text, concluding text, or markdown formatting (like ```json) outside of the JSON array itself.
+    CRITICAL INSTRUCTION: Ensure the entire response is a single, complete, and valid JSON array. Do not truncate the output. If the content is long, focus on the most critical scenarios first but ensure the JSON structure is perfectly valid and complete.
 
+    
     Example of the required detail and structure:
     [
       {{
@@ -199,8 +285,147 @@ def _handle_ai_json_object_response(ai_response_text: str, source_description: s
     except Exception as e:
         app.logger.error(f"Unexpected error in _handle_ai_json_object_response for {source_description}: {e}", exc_info=True)
         return create_response(error="Unexpected error processing AI object response.", status_code=500)
+    
+
+def _handle_ai_json_object_response_internal(ai_response_text: str):
+    """
+    Parses AI response expecting a single JSON object.
+    Returns a dictionary with parsed data or an error dict.
+    """
+    if ai_response_text.startswith("Error:"):
+        return {"error": True, "raw_text": ai_response_text, "warning": "AI failed to generate a response."}
+    
+    try:
+        cleaned_text = _clean_ai_response_for_json(ai_response_text)
+        if not cleaned_text: raise json.JSONDecodeError("Cleaned AI response is empty.", cleaned_text, 0)
+        
+        parsed_data = json.loads(cleaned_text)
+        if not isinstance(parsed_data, dict):
+            raise json.JSONDecodeError("AI response did not parse into a JSON object.", cleaned_text, 0)
+        
+        # Success returns the parsed dictionary
+        return {"data": parsed_data} 
+    except json.JSONDecodeError as e:
+        app.logger.error(f"JSONDecodeError (object expected): {e}")
+        # Failure returns an error structure
+        return {
+            "error": True,
+            "raw_text": ai_response_text,
+            "warning": f"AI response was not valid JSON object. Error: {e}. Displaying raw text."
+        }
 
 # --- API Endpoints ---
+
+
+@app.route('/api/analyze-defect', methods=['POST'])
+def analyze_defect_endpoint():
+    """
+    Analyzes defect information using Gemini and saves the result to MongoDB.
+    """
+    app.logger.info("Received request for /api/analyze-defect")
+    data = request.get_json()
+
+    if not data or not data.get('failed_test', '').strip():
+        return create_response(error="The 'Failed Test Case / Scenario' field is required.", status_code=400)
+
+    failed_test = data['failed_test']
+    error_logs = truncate_text(data.get('error_logs', ''), MAX_AI_INPUT_CHARS // 2)
+    steps = data.get('steps_reproduced', 'Not Provided').strip()
+    source_info_text = f"Defect Analysis for: {failed_test}"
+    
+    prompt = f"""
+    Act as an expert Software Debugging Analyst.
+    Analyze the following defect information.
+    Return a single JSON object with the keys: "potential_root_cause", "suggested_severity_level" (one of: "Low", "Medium", "High", "Critical"), "severity_justification", and "defect_summary_draft".
+    Do NOT include any text outside this single JSON object.
+
+    Information Provided:
+    ---
+    Failed Test Case/Scenario: {failed_test}
+    Error Logs: ```{error_logs}```
+    Steps to Reproduce: {steps}
+    ---
+    JSON Defect Analysis:
+    """
+    try:
+        ai_response_text = generate_text([prompt])
+        result = _handle_ai_json_object_response_internal(ai_response_text, source_info_text)
+
+        analysis_to_save = {}
+        is_fallback = False
+        if "error" in result:
+            is_fallback = True
+            analysis_to_save = {"raw_text": result.get("raw_text"), "warning": result.get("warning")}
+            app.logger.warning(f"Saving raw text fallback for defect analysis.")
+        else:
+            analysis_to_save = result["data"]
+
+        new_analysis = AiAnalysis(
+            analysis_type='defect',
+            source_info=source_info_text,
+            analysis_json=analysis_to_save
+        )
+        new_analysis.save()
+        app.logger.info(f"Successfully saved defect analysis to MongoDB. DB ID: {new_analysis.id}")
+        
+        if is_fallback:
+            # If it was a fallback, we still need to send the warning to the frontend
+            return create_response({"analysis": analysis_to_save["raw_text"], "warning": analysis_to_save["warning"]}, status_code=200)
+        else:
+            return create_response(new_analysis.to_dict())
+
+    except Exception as e:
+        app.logger.error(f"Error in analyze_defect_endpoint: {e}", exc_info=True)
+        return create_response(error="Failed to generate defect analysis due to an internal server error.", status_code=500)
+
+
+@app.route('/api/dashboard-stats', methods=['GET'])
+def get_dashboard_stats():
+    """Gathers and returns statistics for the main dashboard from MongoDB."""
+    try:
+        # 1. Key Metrics
+        total_test_cases = TestCase.objects.count()
+        total_automation_analyses = AiAnalysis.objects(analysis_type='automation').count()
+        total_defect_analyses = AiAnalysis.objects(analysis_type='defect').count()
+        
+        # 2. Test Case Severity Chart Data using an aggregation pipeline
+        pipeline = [
+            { "$match": { "severity": { "$ne": None, "$ne": "" } } }, # Exclude null and empty strings
+            { "$group": { "_id": "$severity", "count": { "$sum": 1 } } },
+            { "$sort": { "_id": 1 } }
+        ]
+        severity_distribution = list(TestCase.objects.aggregate(pipeline))
+        
+        severity_chart_data = {
+            'labels': [item['_id'] for item in severity_distribution],
+            'data': [item['count'] for item in severity_distribution]
+        }
+
+        # NEW: Fetch recent Test Case Generation events
+        recent_generations = TestCaseGeneration.objects.order_by('-created_at').limit(5)
+        recent_generations_dicts = [gen.to_dict() for gen in recent_generations]
+
+        # 3. Recent AI Analyses
+        recent_analyses = AiAnalysis.objects.order_by('-created_at').limit(5)
+        recent_analyses_dicts = [analysis.to_dict() for analysis in recent_analyses]
+        
+        dashboard_data = {
+            "key_metrics": {
+                "total_test_cases": total_test_cases,
+                "total_defect_analyses": total_defect_analyses,
+                "total_automation_analyses": total_automation_analyses
+            },
+            "severity_chart": severity_chart_data,
+            "recent_analyses": recent_analyses_dicts,
+            "recent_generations": recent_generations_dicts
+        }
+        
+        app.logger.info("Successfully fetched dashboard stats.")
+        return create_response(dashboard_data)
+
+    except Exception as e:
+        app.logger.error(f"Error fetching dashboard stats from MongoDB: {e}", exc_info=True)
+        return create_response(error="Could not retrieve dashboard statistics.", status_code=500)
 
 
 #This endpoint will receive a list of existing test cases and return a list of IDs for those that should be automated
@@ -262,19 +487,121 @@ def health_check():
     return create_response({"status": "Backend is running"})
 
 
+# @app.route('/api/suggest-test-cases-from-images', methods=['POST'])
+# def suggest_test_cases_from_images_endpoint():
+#     app.logger.info("Received request for /api/suggest-test-cases-from-images")
+#     if 'file' not in request.files: return create_response(error="No file part in request", status_code=400)
+    
+#     file = request.files['file']
+#     if file.filename == '': return create_response(error="No selected file", status_code=400)
+    
+#     if file and get_file_extension(file.filename) == 'zip':
+#         original_filename = secure_filename(file.filename)
+#         source_description = f"Image ZIP: {original_filename}"
+        
+#         try:
+#             images_data = process_zip_file_for_images(file.stream)
+#             if not images_data:
+#                 return create_response(error="No supported images (PNG/JPG) found in the ZIP file.", status_code=400)
+#             app.logger.info(f"Extracted {len(images_data)} images from ZIP file.")
+            
+#             prompt_text = """
+#             Act as an expert Software Quality Assurance Engineer specializing in UI/UX testing.
+#             Analyze the following user interface screenshots. Based on the visual elements, layout, and text visible in these images, generate a flat list of detailed test cases.
+
+#             For each test case, provide the following details as key-value pairs:
+#             - "id": (string) A unique identifier like TC-UI-01.
+#             - "scenario": (string) The name of the screen or component being tested (e.g., "Login Screen", "Contact Form").
+#             - "type": (string, one of: "Positive" or "Negative") The nature of the test.
+#             - "test_case_summary": (string) A concise description of the specific test.
+#             - "test_steps": (array of strings) The actions to perform.
+#             - "test_data": (array of strings) Example data used, if any.
+#             - "expected_result": (string) The expected visual or functional outcome.
+#             - "priority": (string, one of: "P1", "P2", "P3").
+#             - "severity": (string, one of: "High", "Medium", "Low").
+
+#             CRITICAL INSTRUCTION: Ensure the entire response is a single, complete, and valid JSON array. Do not truncate the output. Prioritize quality and completeness of the JSON structure.
+#             Return the output strictly as a single JSON array of these test case objects. Do NOT include any text outside the JSON array.
+#             """ 
+
+#             prompt_parts = [prompt_text]
+#             for img_data in images_data:
+#                 prompt_parts.append(f"Analyzing image: {img_data['filename']}")
+#                 prompt_parts.append(img_data['image'])
+            
+#             ai_response_text = generate_text(prompt_parts)
+#             parsed_result = _handle_ai_json_response_internal(ai_response_text) # expects_array is default True
+
+#             if "error" in parsed_result:
+#                 return create_response({
+#                     "suggestions": parsed_result.get("raw_text"),
+#                     "source": source_description,
+#                     "warning": parsed_result.get("warning")
+#                 }, status_code=200)
+
+#             # --- MODIFIED DATABASE LOGIC ---
+#             suggestions_list = parsed_result.get("data", []) # This list is already flat
+#             if not suggestions_list:
+#                 app.logger.info("AI returned no test cases to save from image input.")
+#                 return create_response({"suggestions": [], "source": source_description})
+
+#             # 1. Create the parent TestCaseGeneration event
+#             generation_event = TestCaseGeneration(
+#                 source_type=source_description,
+#                 test_case_count=len(suggestions_list)
+#             )
+#             generation_event.save()
+
+#             # 2. Create and link each TestCase
+#             saved_test_cases = []
+#             for tc_data in suggestions_list:
+#                 new_case = TestCase(
+#                     generation_event=generation_event, # <-- Link to the event
+#                     case_id_string=tc_data.get('id'),
+#                     scenario=tc_data.get('scenario'),
+#                     summary=tc_data.get('test_case_summary'),
+#                     pre_condition=tc_data.get('pre_condition'),
+#                     test_steps=tc_data.get('test_steps', []),
+#                     test_data=tc_data.get('test_data', {}),
+#                     expected_result=tc_data.get('expected_result'),
+#                     priority=tc_data.get('priority'),
+#                     severity=tc_data.get('severity')
+#                     # Note: We also pass 'type' from the AI response to the frontend via to_dict if needed, but it's not a DB field
+#                 )
+#                 new_case.save()
+#                 saved_test_cases.append(new_case)
+            
+#             # 3. (Optional) Update the event with the saved test case IDs
+#             generation_event.test_case_ids = [case.id for case in saved_test_cases]
+#             generation_event.save()
+            
+#             app.logger.info(f"Saved TestCaseGeneration event {generation_event.id} with {len(saved_test_cases)} test cases from image ZIP.")
+            
+#             # 4. Prepare and return the response
+#             saved_test_cases_dicts = [case.to_dict() for case in saved_test_cases]
+#             # Add the 'type' back in for the frontend grouping helper
+#             for i, tc_dict in enumerate(saved_test_cases_dicts):
+#                 tc_dict['type'] = suggestions_list[i].get('type')
+                
+#             return create_response({"suggestions": saved_test_cases_dicts, "source": source_description})
+            
+#         except (ValueError, IOError) as e:
+#             app.logger.error(f"Error processing ZIP file {original_filename}: {e}")
+#             return create_response(error=str(e), status_code=400)
+#         except Exception as e:
+#             app.logger.error(f"Unexpected error processing image ZIP: {e}", exc_info=True)
+#             return create_response(error="An internal server error occurred while processing the images.", status_code=500)
+#     else:
+#         return create_response(error="File type not allowed. Please upload a ZIP file.", status_code=400)
+
+
 @app.route('/api/suggest-test-cases-from-images', methods=['POST'])
 def suggest_test_cases_from_images_endpoint():
-    """
-    Analyzes a ZIP of UI images and suggests test cases.
-    EXPECTS A FLAT LIST OF TEST CASES, NOT NESTED SCENARIOS.
-    """
     app.logger.info("Received request for /api/suggest-test-cases-from-images")
-    if 'file' not in request.files:
-        return create_response(error="No file part in request", status_code=400)
+    if 'file' not in request.files: return create_response(error="No file part in request", status_code=400)
     
     file = request.files['file']
-    if file.filename == '':
-        return create_response(error="No selected file", status_code=400)
+    if file.filename == '': return create_response(error="No selected file", status_code=400)
     
     if file and get_file_extension(file.filename) == 'zip':
         original_filename = secure_filename(file.filename)
@@ -286,38 +613,66 @@ def suggest_test_cases_from_images_endpoint():
                 return create_response(error="No supported images (PNG/JPG) found in the ZIP file.", status_code=400)
             app.logger.info(f"Extracted {len(images_data)} images from ZIP file.")
             
-            # --- NEW, SIMPLER PROMPT SPECIFICALLY FOR IMAGES (WITH "type") ---
             prompt_text = """
             Act as an expert Software Quality Assurance Engineer specializing in UI/UX testing.
-            Analyze the following user interface screenshots. Based on the visual elements, layout, and text visible in these images, generate a flat list of detailed test cases.
-
-            For each test case, provide the following details as key-value pairs:
-            - "id": (string) A unique identifier like TC-UI-01.
-            - "scenario": (string) The name of the screen or component being tested (e.g., "Login Screen", "Contact Form").
-            - "type": (string, one of: "Positive" or "Negative") The nature of the test. "Positive" for happy paths, "Negative" for error conditions or invalid inputs.
-            - "test_case_summary": (string) A concise description of the specific test.
-            - "test_steps": (array of strings) The actions to perform.
-            - "test_data": (array of strings) Example data used, if any.
-            - "expected_result": (string) The expected visual or functional outcome.
-            - "priority": (string, one of: "P1", "P2", "P3").
-            - "severity": (string, one of: "High", "Medium", "Low").
-
+            Analyze the following user interface screenshots... generate a flat list of detailed test cases.
+            For each test case, provide... "id", "scenario", "type" ("Positive" or "Negative"), "test_case_summary", "test_steps" (array), "test_data" (array), "expected_result", "priority" ("P1", "P2", "P3"), and "severity" ("High", "Medium", "Low").
             Return the output strictly as a single JSON array of these test case objects. Do NOT include any text outside the JSON array.
             """ 
-
             prompt_parts = [prompt_text]
             for img_data in images_data:
                 prompt_parts.append(f"Analyzing image: {img_data['filename']}")
                 prompt_parts.append(img_data['image'])
             
             ai_response_text = generate_text(prompt_parts)
+            parsed_result = _handle_ai_json_response_internal(ai_response_text)
+
+            if "error" in parsed_result:
+                return create_response({
+                    "suggestions": parsed_result.get("raw_text"),
+                    "source": source_description,
+                    "warning": parsed_result.get("warning")
+                }, status_code=200)
+
+            # --- DATABASE LOGIC ---
+            suggestions_list = parsed_result.get("data", [])
+            if not suggestions_list:
+                return create_response({"suggestions": [], "source": source_description})
+
+            generation_event = TestCaseGeneration(
+                source_type=source_description,
+                test_case_count=len(suggestions_list)
+            )
+            generation_event.save()
+
+            saved_test_cases = []
+            for tc_data in suggestions_list:
+                new_case = TestCase(
+                    generation_event=generation_event,
+                    case_id_string=tc_data.get('id'),
+                    scenario=tc_data.get('scenario'),
+                    summary=tc_data.get('test_case_summary'),
+                    pre_condition=tc_data.get('pre_condition'),
+                    test_steps=tc_data.get('test_steps', []),
+                    test_data=tc_data.get('test_data', {}),
+                    expected_result=tc_data.get('expected_result'),
+                    priority=tc_data.get('priority'),
+                    severity=tc_data.get('severity')
+                )
+                new_case.save()
+                saved_test_cases.append(new_case)
             
-            # Use the existing helper that expects an array of test cases
-            return _handle_ai_json_array_response(ai_response_text, source_description)
+            generation_event.test_case_ids = [case.id for case in saved_test_cases]
+            generation_event.save()
             
-        except (ValueError, IOError) as e:
-            app.logger.error(f"Error processing ZIP file {original_filename}: {e}")
-            return create_response(error=str(e), status_code=400)
+            app.logger.info(f"Saved TestCaseGeneration event {generation_event.id} with {len(saved_test_cases)} test cases from images.")
+            
+            saved_test_cases_dicts = [case.to_dict() for case in saved_test_cases]
+            for i, tc_dict in enumerate(saved_test_cases_dicts):
+                tc_dict['type'] = suggestions_list[i].get('type')
+                
+            return create_response({"suggestions": saved_test_cases_dicts, "source": source_description})
+            
         except Exception as e:
             app.logger.error(f"Unexpected error processing image ZIP: {e}", exc_info=True)
             return create_response(error="An internal server error occurred while processing the images.", status_code=500)
@@ -332,82 +687,390 @@ def suggest_test_cases_from_text_endpoint():
     app.logger.info("Received request for /api/suggest-test-cases (text input)")
     data = request.get_json()
     if not data or 'requirements' not in data or not data['requirements'].strip():
-        return create_response(error="Missing or empty 'requirements' field in request body", status_code=400)
+        return create_response(error="Missing or empty 'requirements' field", status_code=400)
     
+    source_description = "Text Input"
     requirements_text = truncate_text(data['requirements'], MAX_AI_INPUT_CHARS)
-    app.logger.info(f"Analyzing requirements text (first 100 chars): {requirements_text[:100]}...") # Log from your version
+    prompt = _generate_json_test_case_prompt(source_description, requirements_text)
     
-    prompt = _generate_json_test_case_prompt("Text Input", requirements_text)
     try:
-        ai_response_text = generate_text(prompt)
-        return _handle_ai_json_array_response(ai_response_text, "Text Input")
+        ai_response_text = generate_text([prompt])
+        parsed_result = _handle_ai_json_response_internal(ai_response_text, expects_array=True)
+
+        if "error" in parsed_result:
+            return create_response({
+                "suggestions": parsed_result.get("raw_text"),
+                "source": source_description,
+                "warning": parsed_result.get("warning")
+            }, status_code=200)
+
+        # --- DATABASE LOGIC ---
+        suggestions_list = parsed_result.get("data", [])
+        all_tcs_flat = get_flattened_tcs_backend(suggestions_list)
+        
+        if not all_tcs_flat:
+            return create_response({"suggestions": [], "source": source_description})
+
+        generation_event = TestCaseGeneration(
+            source_type=source_description,
+            test_case_count=len(all_tcs_flat)
+        )
+        generation_event.save()
+
+        saved_test_cases = []
+        for tc_data in all_tcs_flat:
+            new_case = TestCase(
+                generation_event=generation_event,
+                case_id_string=tc_data.get('id'),
+                scenario=tc_data.get('scenario_title') or tc_data.get('scenario'),
+                summary=tc_data.get('test_case_summary'),
+                pre_condition=tc_data.get('pre_condition'),
+                test_steps=tc_data.get('test_steps', []),
+                test_data=tc_data.get('test_data', {}),
+                expected_result=tc_data.get('expected_result'),
+                priority=tc_data.get('priority'),
+                severity=tc_data.get('severity')
+            )
+            new_case.save()
+            saved_test_cases.append(new_case)
+        
+        generation_event.test_case_ids = [case.id for case in saved_test_cases]
+        generation_event.save()
+        
+        app.logger.info(f"Saved TestCaseGeneration event {generation_event.id} with {len(saved_test_cases)} test cases from text.")
+        
+        saved_test_cases_dicts = [case.to_dict() for case in saved_test_cases]
+        return create_response({"suggestions": saved_test_cases_dicts, "source": source_description})
+
     except Exception as e:
-        app.logger.error(f"Error during GenAI call for text input: {e}", exc_info=True) # Log from your version
-        return create_response(error="Failed to generate suggestions due to an internal error.", status_code=500)
+        app.logger.error(f"Error in suggest_test_cases_from_text_endpoint: {e}", exc_info=True)
+        return create_response(error="Internal server error.", status_code=500)
+
+
+@app.route('/api/test-case-generations/<string:generation_id>', methods=['DELETE'])
+def delete_test_case_generation(generation_id):
+    """Deletes a generation event and all associated test cases."""
+    app.logger.info(f"Received DELETE request for TestCaseGeneration ID: {generation_id}")
+    try:
+        generation_event = TestCaseGeneration.objects.get(id=generation_id)
+        
+        # Delete all test cases linked to this event
+        # The ReferenceField makes this easy
+        TestCase.objects(generation_event=generation_event).delete()
+        
+        # Delete the event itself
+        generation_event.delete()
+        
+        app.logger.info(f"Successfully deleted event {generation_id} and its test cases.")
+        return create_response({"message": "Test case generation event and all related test cases deleted."})
+        
+    except TestCaseGeneration.DoesNotExist:
+        return create_response(error="Generation event not found.", status_code=404)
+    except Exception as e:
+        app.logger.error(f"Error deleting generation event {generation_id}: {e}", exc_info=True)
+        return create_response(error="Failed to delete generation event.", status_code=500)
 
 
 @app.route('/api/suggest-test-cases-from-file', methods=['POST'])
 def suggest_test_cases_from_file_endpoint():
     app.logger.info("Received request for /api/suggest-test-cases-from-file")
-    if 'file' not in request.files:
-        return create_response(error="No file part in the request", status_code=400)
+    if 'file' not in request.files: return create_response(error="No file part", status_code=400)
     file = request.files['file']
-    if file.filename == '':
-        return create_response(error="No selected file", status_code=400)
+    if file.filename == '': return create_response(error="No selected file", status_code=400)
 
-    if file and allowed_file(file.filename):
+    if file and get_file_extension(file.filename) in ('pdf', 'docx'):
         original_filename = secure_filename(file.filename)
-        app.logger.info(f"Processing uploaded file: {original_filename}") # Log from your version
-        file_stream = file.stream
-        file_ext = get_file_extension(original_filename)
-        extracted_text = ""
         source_description = f"File: {original_filename}"
-
         try:
-            if file_ext == 'pdf':
-                extracted_text = parse_pdf(file_stream)
-            elif file_ext == 'docx':
-                extracted_text = parse_docx(file_stream)
-            # Removed `else` that returned 500, as `allowed_file` should prevent this.
-
-            if not extracted_text or not extracted_text.strip():
-                 return create_response(error="Could not extract text from the file or file is empty.", status_code=400)
-
-            app.logger.info(f"Extracted {len(extracted_text)} characters from {original_filename}") # Log from your version
-            extracted_text = truncate_text(extracted_text, MAX_AI_INPUT_CHARS)
+            file_ext = get_file_extension(original_filename)
+            extracted_text = parse_pdf(file.stream) if file_ext == 'pdf' else parse_docx(file.stream)
+            if not extracted_text.strip():
+                return create_response(error="Could not extract text or file is empty.", status_code=400)
             
+            extracted_text = truncate_text(extracted_text, MAX_AI_INPUT_CHARS)
             prompt = _generate_json_test_case_prompt(source_description, extracted_text)
-            ai_response_text = generate_text(prompt)
-            return _handle_ai_json_array_response(ai_response_text, source_description)
+            ai_response_text = generate_text([prompt])
+            parsed_result = _handle_ai_json_response_internal(ai_response_text, expects_array=True)
 
-        except ValueError as ve:
-             app.logger.error(f"File parsing error for {original_filename}: {ve}") # Log from your version
-             return create_response(error=str(ve), status_code=400)
+            if "error" in parsed_result:
+                return create_response({
+                    "suggestions": parsed_result.get("raw_text"),
+                    "source": source_description,
+                    "warning": parsed_result.get("warning")
+                }, status_code=200)
+
+            # --- CORRECTED DATABASE LOGIC ---
+            suggestions_list = parsed_result.get("data", [])
+            all_tcs_flat = get_flattened_tcs_backend(suggestions_list)
+
+            if not all_tcs_flat:
+                app.logger.info("AI returned no test cases to save from file.")
+                return create_response({"suggestions": [], "source": source_description})
+
+            # 1. Create the parent TestCaseGeneration event
+            generation_event = TestCaseGeneration(
+                source_type=source_description,
+                test_case_count=len(all_tcs_flat)
+            )
+            generation_event.save() # Save it to get an ID
+
+            # 2. Create each TestCase and link it to the generation event
+            saved_test_cases = []
+            for tc_data in all_tcs_flat:
+                new_case = TestCase(
+                    generation_event=generation_event, # <-- Link to the event
+                    case_id_string=tc_data.get('id'),
+                    scenario=tc_data.get('scenario_title') or tc_data.get('scenario'),
+                    summary=tc_data.get('test_case_summary'),
+                    pre_condition=tc_data.get('pre_condition'),
+                    test_steps=tc_data.get('test_steps', []),
+                    test_data=tc_data.get('test_data', {}),
+                    expected_result=tc_data.get('expected_result'),
+                    priority=tc_data.get('priority'),
+                    severity=tc_data.get('severity')
+                )
+                new_case.save()
+                saved_test_cases.append(new_case)
+            
+            # 3. (Optional but good practice) Update the event with the list of TestCase IDs
+            generation_event.test_case_ids = [case.id for case in saved_test_cases]
+            generation_event.save()
+            
+            app.logger.info(f"Saved TestCaseGeneration event {generation_event.id} with {len(saved_test_cases)} test cases from file.")
+            
+            # 4. Prepare and return the response
+            saved_test_cases_dicts = [case.to_dict() for case in saved_test_cases]
+            # To maintain the original structure for the frontend, we return the original parsed list
+            # but now the frontend knows the save was successful. Let's return the saved data
+            # so the frontend has the correct DB IDs for immediate editing.
+            return create_response({"suggestions": saved_test_cases_dicts, "source": source_description})
+
         except Exception as e:
-             app.logger.error(f"Error processing file {original_filename}: {e}", exc_info=True) # Log from your version
-             return create_response(error="An internal server error occurred while processing the file.", status_code=500)
-    else:
-        return create_response(error="File type not allowed. Please upload PDF or DOCX.", status_code=400)
+             app.logger.error(f"Error processing file {original_filename}: {e}", exc_info=True)
+             return create_response(error="Error processing file.", status_code=500)
+    else: return create_response(error="File type not allowed.", status_code=400)
+
+# You'll also need a backend version of the flattening helper
+def get_flattened_tcs_backend(suggestions_data):
+    if not suggestions_data or not isinstance(suggestions_data, list): return []
+    if suggestions_data and suggestions_data[0] and suggestions_data[0].get('scenario_title'):
+        flat_list = []
+        for scenario in suggestions_data:
+            positive_cases = scenario.get('positive_test_cases', [])
+            negative_cases = scenario.get('negative_test_cases', [])
+            for tc in positive_cases:
+                tc['scenario_title'] = scenario.get('scenario_title')
+                tc['type'] = 'Positive'
+                flat_list.append(tc)
+            for tc in negative_cases:
+                tc['scenario_title'] = scenario.get('scenario_title')
+                tc['type'] = 'Negative'
+                flat_list.append(tc)
+        return flat_list
+    return suggestions_data
+
+def _handle_ai_json_response_internal(ai_response_text: str, expects_array: bool = True):
+    """
+    Parses AI response expecting JSON.
+    Returns a dictionary with parsed data or an error dict.
+    """
+    # <<< NEW DEBUG LOG >>>
+    app.logger.info(f"--- FULL AI RESPONSE RECEIVED ---\n{ai_response_text}\n--- END OF RESPONSE ---")
+
+    if ai_response_text.startswith("Error:"):
+        return {"error": True, "raw_text": ai_response_text, "warning": "AI failed to generate a response."}
+    
+    try:
+        cleaned_text = _clean_ai_response_for_json(ai_response_text)
+        if not cleaned_text: raise json.JSONDecodeError("Cleaned AI response is empty.", cleaned_text, 0)
+        
+        parsed_data = json.loads(cleaned_text)
+        
+        if expects_array and not isinstance(parsed_data, list):
+            raise json.JSONDecodeError("AI response did not parse into a JSON array.", cleaned_text, 0)
+        if not expects_array and not isinstance(parsed_data, dict):
+             raise json.JSONDecodeError("AI response did not parse into a JSON object.", cleaned_text, 0)
+
+        return {"data": parsed_data} # Success
+    except json.JSONDecodeError as e:
+        app.logger.error(f"JSONDecodeError: {e}")
+        return {
+            "error": True,
+            "raw_text": ai_response_text,
+            "warning": f"AI response was not valid JSON. Error: {e}. Displaying raw text."
+        }
+
+
+@app.route('/api/test-cases/<string:case_id>', methods=['PUT'])
+def update_test_case(case_id):
+    """Updates an existing test case in MongoDB."""
+    app.logger.info(f"Received PUT request for TestCase ID: {case_id}")
+    try:
+        # Find the document by its unique MongoDB ID
+        case = TestCase.objects.get(id=case_id)
+        data = request.get_json()
+        if not data:
+            return create_response(error="Invalid request body.", status_code=400)
+        
+        # Update fields from the request data, using the correct model field names
+        case.case_id_string = data.get('case_id_string', case.case_id_string)
+        case.scenario = data.get('scenario', case.scenario)
+        case.summary = data.get('summary', case.summary)
+        case.pre_condition = data.get('pre_condition', case.pre_condition)
+        case.test_steps = data.get('test_steps_json', case.test_steps) 
+        case.test_data = data.get('test_data_json', case.test_data)
+        case.expected_result = data.get('expected_result', case.expected_result)
+        case.priority = data.get('priority', case.priority)
+        case.severity = data.get('severity', case.severity)
+        
+        case.save() # Save the changes to MongoDB
+        app.logger.info(f"Successfully updated TestCase with ID {case_id}")
+        return create_response(case.to_dict())
+
+    except TestCase.DoesNotExist:
+        return create_response(error="Test Case not found.", status_code=404)
+    except Exception as e:
+        app.logger.error(f"Error updating TestCase {case_id}: {e}", exc_info=True)
+        return create_response(error="Failed to update test case.", status_code=500)
+
+
+@app.route('/api/test-cases/<string:case_id>', methods=['DELETE'])
+def delete_test_case(case_id):
+    """Deletes a specific test case from the database."""
+    app.logger.info(f"Received DELETE request for TestCase ID: {case_id}")
+    try:
+        test_case_to_delete = TestCase.objects.get(id=case_id)
+        test_case_to_delete.delete()
+        app.logger.info(f"Successfully deleted TestCase with ID: {case_id}")
+        return create_response({"message": f"Test case {case_id} deleted successfully."})
+    except TestCase.DoesNotExist:
+        return create_response(error="Test case not found.", status_code=404)
+    except Exception as e:
+        app.logger.error(f"Error deleting TestCase {case_id}: {e}", exc_info=True)
+        return create_response(error="Failed to delete test case.", status_code=500)
+
+
+@app.route('/api/ai-analyses/<string:analysis_id>', methods=['DELETE'])
+def delete_ai_analysis(analysis_id):
+    """Deletes a specific AI analysis from the database."""
+    app.logger.info(f"Received DELETE request for AiAnalysis ID: {analysis_id}")
+    try:
+        # Find the document by its unique MongoDB ID
+        analysis_to_delete = AiAnalysis.objects.get(id=analysis_id)
+        # This removes the document from the MongoDB collection
+        analysis_to_delete.delete()
+        app.logger.info(f"Successfully deleted AiAnalysis with ID: {analysis_id}")
+        # Return a success message
+        return create_response({"message": f"Analysis {analysis_id} deleted successfully."})
+        
+    except AiAnalysis.DoesNotExist:
+        return create_response(error="Analysis not found.", status_code=404)
+    except Exception as e:
+        app.logger.error(f"Error deleting AiAnalysis {analysis_id}: {e}", exc_info=True)
+        return create_response(error="Failed to delete analysis.", status_code=500)
+
+
+# @app.route('/api/suggest-test-cases-from-figma', methods=['POST'])
+# def suggest_test_cases_from_figma_endpoint():
+#     app.logger.info("Received request for /api/suggest-test-cases-from-figma")
+#     data = request.get_json()
+#     if not data or not all(k in data and data[k].strip() for k in ['figma_url', 'figma_token']):
+#         return create_response(error="Missing figma_url or figma_token", status_code=400)
+    
+#     figma_url, figma_token = data['figma_url'], data['figma_token']
+#     source_description = "Figma File" 
+
+#     try:
+#         file_key = extract_file_key_from_url(figma_url)
+#         if not file_key:
+#             return create_response(error="Could not extract valid File Key from the provided Figma URL.", status_code=400)
+#         source_description = f"Figma File ({file_key})"
+
+#         figma_json_content = get_figma_file_content(file_key, figma_token)
+#         extracted_text = process_figma_data(figma_json_content)
+
+#         if not extracted_text or not extracted_text.strip():
+#              return create_response(error="Could not extract any text content from the Figma file via API.", status_code=400)
+        
+#         extracted_text = truncate_text(extracted_text, MAX_AI_INPUT_CHARS)
+#         prompt = _generate_json_test_case_prompt(source_description, extracted_text, is_figma=True)
+#         ai_response_text = generate_text([prompt])
+#         parsed_result = _handle_ai_json_response_internal(ai_response_text, expects_array=True)
+
+#         if "error" in parsed_result:
+#             return create_response({
+#                 "suggestions": parsed_result.get("raw_text"),
+#                 "source": source_description,
+#                 "warning": parsed_result.get("warning")
+#             }, status_code=200)
+
+#         # --- MODIFIED DATABASE LOGIC ---
+#         suggestions_list = parsed_result.get("data", [])
+#         all_tcs_flat = get_flattened_tcs_backend(suggestions_list)
+        
+#         if not all_tcs_flat:
+#             app.logger.info("AI returned no test cases to save from Figma input.")
+#             return create_response({"suggestions": [], "source": source_description})
+
+#         # 1. Create the parent TestCaseGeneration event
+#         generation_event = TestCaseGeneration(
+#             source_type=source_description,
+#             test_case_count=len(all_tcs_flat)
+#         )
+#         generation_event.save()
+
+#         # 2. Create and link each TestCase
+#         saved_test_cases = []
+#         for tc_data in all_tcs_flat:
+#             new_case = TestCase(
+#                 generation_event=generation_event, # <-- Link to the event
+#                 case_id_string=tc_data.get('id'),
+#                 scenario=tc_data.get('scenario_title') or tc_data.get('scenario'),
+#                 summary=tc_data.get('test_case_summary'),
+#                 pre_condition=tc_data.get('pre_condition'),
+#                 test_steps=tc_data.get('test_steps', []),
+#                 test_data=tc_data.get('test_data', {}),
+#                 expected_result=tc_data.get('expected_result'),
+#                 priority=tc_data.get('priority'),
+#                 severity=tc_data.get('severity')
+#             )
+#             new_case.save()
+#             saved_test_cases.append(new_case)
+        
+#         # 3. (Optional) Update the event with the saved test case IDs
+#         generation_event.test_case_ids = [case.id for case in saved_test_cases]
+#         generation_event.save()
+        
+#         app.logger.info(f"Saved TestCaseGeneration event {generation_event.id} with {len(saved_test_cases)} test cases from Figma.")
+        
+#         # 4. Prepare and return the response
+#         saved_test_cases_dicts = [case.to_dict() for case in saved_test_cases]
+#         return create_response({"suggestions": saved_test_cases_dicts, "source": source_description})
+
+#     except ConnectionError as ce:
+#          return create_response(error=str(ce), status_code=502)
+#     except ValueError as ve:
+#          return create_response(error=f"Error processing Figma data: {ve}", status_code=500)
+#     except Exception as e:
+#          app.logger.error(f"Unexpected error processing Figma URL {figma_url}: {e}", exc_info=True)
+#          return create_response(error="An internal server error occurred processing the Figma request.", status_code=500)
+
 
 
 @app.route('/api/suggest-test-cases-from-figma', methods=['POST'])
 def suggest_test_cases_from_figma_endpoint():
     app.logger.info("Received request for /api/suggest-test-cases-from-figma")
     data = request.get_json()
-    required_fields = ['figma_url', 'figma_token']
-    if not data or not all(field in data and data[field].strip() for field in required_fields):
-        return create_response(error=f"Missing or empty required fields: {required_fields}", status_code=400)
-
-    figma_url = data['figma_url']
-    figma_token = data['figma_token']
-    app.logger.info(f"Processing Figma URL: {figma_url}") # Log from your version
-    source_description = "" 
+    if not data or not all(k in data and data[k].strip() for k in ['figma_url', 'figma_token']):
+        return create_response(error="Missing figma_url or figma_token", status_code=400)
+    
+    figma_url, figma_token = data['figma_url'], data['figma_token']
+    source_description = "Figma File" 
 
     try:
         file_key = extract_file_key_from_url(figma_url)
         if not file_key:
             return create_response(error="Could not extract valid File Key from the provided Figma URL.", status_code=400)
-        app.logger.info(f"Extracted Figma file key: {file_key}") # Log from your version
         source_description = f"Figma File ({file_key})"
 
         figma_json_content = get_figma_file_content(file_key, figma_token)
@@ -415,78 +1078,67 @@ def suggest_test_cases_from_figma_endpoint():
 
         if not extracted_text or not extracted_text.strip():
              return create_response(error="Could not extract any text content from the Figma file via API.", status_code=400)
-        app.logger.info(f"Extracted {len(extracted_text)} characters from Figma file {file_key}") # Log from your version
-        extracted_text = truncate_text(extracted_text, MAX_AI_INPUT_CHARS)
         
+        extracted_text = truncate_text(extracted_text, MAX_AI_INPUT_CHARS)
         prompt = _generate_json_test_case_prompt(source_description, extracted_text, is_figma=True)
-        ai_response_text = generate_text(prompt)
-        return _handle_ai_json_array_response(ai_response_text, source_description)
+        ai_response_text = generate_text([prompt])
+        parsed_result = _handle_ai_json_response_internal(ai_response_text, expects_array=True)
+
+        if "error" in parsed_result:
+            return create_response({
+                "suggestions": parsed_result.get("raw_text"),
+                "source": source_description,
+                "warning": parsed_result.get("warning")
+            }, status_code=200)
+
+        # --- DATABASE LOGIC ---
+        suggestions_list = parsed_result.get("data", [])
+        all_tcs_flat = get_flattened_tcs_backend(suggestions_list)
+        
+        if not all_tcs_flat:
+            return create_response({"suggestions": [], "source": source_description})
+
+        generation_event = TestCaseGeneration(
+            source_type=source_description,
+            test_case_count=len(all_tcs_flat)
+        )
+        generation_event.save()
+
+        saved_test_cases = []
+        for tc_data in all_tcs_flat:
+            new_case = TestCase(
+                generation_event=generation_event,
+                case_id_string=tc_data.get('id'),
+                scenario=tc_data.get('scenario_title') or tc_data.get('scenario'),
+                summary=tc_data.get('test_case_summary'),
+                pre_condition=tc_data.get('pre_condition'),
+                test_steps=tc_data.get('test_steps', []),
+                test_data=tc_data.get('test_data', {}),
+                expected_result=tc_data.get('expected_result'),
+                priority=tc_data.get('priority'),
+                severity=tc_data.get('severity')
+            )
+            new_case.save()
+            saved_test_cases.append(new_case)
+        
+        generation_event.test_case_ids = [case.id for case in saved_test_cases]
+        generation_event.save()
+        
+        app.logger.info(f"Saved TestCaseGeneration event {generation_event.id} with {len(saved_test_cases)} test cases from Figma.")
+        
+        saved_test_cases_dicts = [case.to_dict() for case in saved_test_cases]
+        return create_response({"suggestions": saved_test_cases_dicts, "source": source_description})
 
     except ConnectionError as ce:
-         app.logger.error(f"Figma API connection/request error: {ce}") # Log from your version
          return create_response(error=str(ce), status_code=502)
     except ValueError as ve:
-         app.logger.error(f"Figma data processing error: {ve}", exc_info=True) # Log from your version
          return create_response(error=f"Error processing Figma data: {ve}", status_code=500)
     except Exception as e:
-         app.logger.error(f"Unexpected error processing Figma URL {figma_url}: {e}", exc_info=True) # Log from your version
+         app.logger.error(f"Unexpected error processing Figma URL {figma_url}: {e}", exc_info=True)
          return create_response(error="An internal server error occurred processing the Figma request.", status_code=500)
 
 
 # --- Other AI Feature Endpoints (MODIFIED FOR JSON OUTPUT) ---
-
-@app.route('/api/analyze-defect', methods=['POST'])
-def analyze_defect_endpoint():
-    app.logger.info("Received request for /api/analyze-defect")
-    data = request.get_json()
-    required_fields = ['failed_test', 'error_logs']
-    if not data or not all(field in data and data[field].strip() for field in required_fields):
-        return create_response(error=f"Missing or empty required fields: {required_fields}", status_code=400)
-
-    failed_test = data['failed_test']
-    error_logs = truncate_text(data['error_logs'], MAX_AI_INPUT_CHARS // 2)
-    steps = data.get('steps_reproduced', 'Not Provided').strip()
-    context = data.get('context', 'None').strip()
-    app.logger.info(f"Analyzing defect for test: {failed_test}") # Log from your version
-
-    prompt = f"""
-    Act as an expert Software Debugging Analyst.
-    Analyze the following defect information.
-    Return a single JSON object with the following keys:
-    - "potential_root_cause": (string) A plausible root cause.
-    - "suggested_severity_level": (string, one of: "Low", "Medium", "High", "Critical") The suggested severity.
-    - "severity_justification": (string) Justification for the suggested severity.
-    - "defect_summary_draft": (string) A concise defect summary.
-    Do NOT include any text outside of this single JSON object. Ensure all keys and string values are in double quotes.
-
-    Example JSON output structure:
-    {{
-      "potential_root_cause": "Null pointer exception in PaymentProcessingService due to uninitialized user session data.",
-      "suggested_severity_level": "High",
-      "severity_justification": "Blocks core payment functionality for users without active sessions.",
-      "defect_summary_draft": "Payment fails for users with no active session - NullPointer in PaymentProcessingService"
-    }}
-
-    Information Provided:
-    ---
-    Failed Test Case: {failed_test}
-    Error Logs:
-    ```
-    {error_logs}
-    ```
-    Steps to Reproduce: {steps}
-    Additional Context: {context}
-    ---
-    JSON Defect Analysis:
-    """
-    try:
-        ai_response_text = generate_text(prompt)
-        # MODIFIED: Use the new JSON object response handler
-        return _handle_ai_json_object_response(ai_response_text, f"Defect Analysis for {failed_test}", "analysis")
-    except Exception as e:
-        app.logger.error(f"Error during GenAI call for defect analysis: {e}", exc_info=True) # Log from your version
-        return create_response(error="Failed to generate defect analysis due to an internal error.", status_code=500)
-
 
 @app.route('/api/recommend-automation', methods=['POST'])
 def recommend_automation_endpoint():
@@ -533,7 +1185,7 @@ def recommend_automation_endpoint():
     JSON Automation Analysis:
     """
     try:
-        ai_response_text = generate_text(prompt)
+        ai_response_text = generate_text([prompt])
         # MODIFIED: Use the new JSON object response handler
         return _handle_ai_json_object_response(ai_response_text, f"Automation Rec for '{description[:30]}...'", "recommendation")
     except Exception as e:
@@ -579,7 +1231,7 @@ def analyze_code_change_impact_endpoint():
     JSON Impact Analysis:
     """
     try:
-        ai_response_text = generate_text(prompt)
+        ai_response_text = generate_text([prompt])
         # MODIFIED: Use the new JSON object response handler
         return _handle_ai_json_object_response(ai_response_text, "Code Change Impact Analysis", "impact_analysis")
     except Exception as e:

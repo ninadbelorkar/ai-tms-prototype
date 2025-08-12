@@ -5,7 +5,11 @@ google-generativeai>=0.3
 # PyMuPDF>=1.23.0   # For PDF parsing (fitz)
 PyPDF2>=3.0.0
 python-docx>=1.1.0
-requests>=2.20.0
+# requests>=2.20.0
 Pillow
 Flask-Script
 mongoengine
+Flask-PyMongo
+Flask-Bcrypt
+Flask-JWT-Extended
+jira

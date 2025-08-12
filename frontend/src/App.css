@@ -347,20 +347,29 @@ hr {
   vertical-align: middle;
 }
 
+/* Container for the action buttons */
+.results-actions-container {
+    display: flex;
+    flex-wrap: wrap; /* Allow buttons to wrap on smaller screens */
+    gap: 10px; /* Space between buttons */
+    justify-content: flex-end; /* Align to the right */
+}
+
 /* --- Specific Styles for Action Buttons in Results Header --- */
 .results-action-button {
   background-color: #007bff;
   color: white;
   border: none;
-  padding: 8px 16px; /* Smaller padding for a more compact look */
+  padding: 8px 16px;
   border-radius: 4px;
   cursor: pointer;
-  font-size: 0.9rem; /* Slightly smaller font */
+  font-size: 0.9rem;
   font-weight: 500;
   transition: background-color 0.2s ease;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  white-space: nowrap; /* Prevent text from wrapping inside the button */
 }
 
 .results-action-button:hover:not(:disabled) {
@@ -641,4 +650,113 @@ hr {
 
 .recent-generations-card {
     grid-column: 1 / -1; /* Make this widget span the full width of the grid */
+}
+
+.logout-button {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    background-color: #6c757d;
+    padding: 8px 16px;
+    font-size: 0.9rem;
+}
+.logout-button:hover {
+    background-color: #5a6268;
+}
+
+.auth-form {
+    max-width: 400px;
+    margin: 40px auto;
+}
+
+.auth-switch-link {
+    text-align: center;
+    margin-top: 20px;
+    font-size: 0.9rem;
+}
+
+.auth-switch-link p {
+    margin: 0;
+    color: #6c757d; /* Grey text */
+}
+
+.auth-switch-link a {
+    color: #007bff; /* Blue link */
+    text-decoration: none;
+    font-weight: 600;
+}
+
+.auth-switch-link a:hover {
+    text-decoration: underline;
+}
+
+/* At the end of App.css */
+.chart-container {
+    position: relative;
+    height: 230px; /* Or whatever height you prefer */
+    width: 100%;
+}
+
+/* ... At the end of App.css ... */
+.tabs { border-bottom: 1px solid #ccc; }
+.tabs button { background: none; border: none; padding: 10px 15px; cursor: pointer; }
+.tabs button.active { border-bottom: 3px solid #007bff; font-weight: bold; }
+.tab-content { padding-top: 20px; }
+.gherkin-script { background: #f4f4f4; padding: 15px; border-radius: 5px; white-space: pre-wrap; }
+
+/* At the end of App.css */
+
+.radio-group {
+    display: flex;
+    gap: 20px;
+    margin-top: 5px;
+}
+
+.radio-label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-weight: normal; /* Override the default bold label style if needed */
+}
+
+.header-title-link {
+    text-decoration: none;
+    color: inherit; /* Inherit the white color from the header */
+}
+
+.App-content {
+    padding: 20px; /* Or whatever padding you prefer for your main content area */
+}
+
+.issue-list {
+    margin-top: 20px;
+    padding: 15px;
+    background-color: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 5px;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.issue-list h4 {
+    margin-top: 0;
+    margin-bottom: 10px;
+    font-size: 1rem;
+    color: #495057;
+}
+
+.issue-list ul {
+    list-style-type: none;
+    padding-left: 0;
+    margin: 0;
+}
+
+.issue-list li {
+    padding: 5px 0;
+    border-bottom: 1px solid #e9ecef;
+    font-size: 0.9rem;
+}
+
+.issue-list li:last-child {
+    border-bottom: none;
 }

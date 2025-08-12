@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import logging
@@ -10,8 +12,16 @@ from utils.image_parser import process_zip_file_for_images
 from utils.gemini_client import generate_text
 from utils.file_parser import parse_pdf, parse_docx, get_file_extension
 from utils.figma_client import extract_file_key_from_url, get_figma_file_content, process_figma_data
-from mongoengine import connect, Document, StringField, ListField, DateTimeField, DynamicField, IntField, ReferenceField
+from mongoengine import connect, Document, StringField, ListField, DateTimeField, DynamicField, IntField, ReferenceField, ObjectIdField
 from bson import ObjectId
+# from flask_pymongo import PyMongo
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager, decode_token
+from bson.errors import InvalidId
+from werkzeug.exceptions import Forbidden, NotFound
+from jira import JIRA
+from requests_oauthlib import OAuth2Session
+from flask import redirect, session
 
 
 # --- Flask App Setup ---
@@ -19,6 +29,140 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 app.logger.setLevel(logging.INFO)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# --- App Configuration ---
+app.secret_key = os.urandom(24) # A strong, random secret key for JWT
+
+# --- Initialize Extensions ---
+bcrypt = Bcrypt(app)
+jwt = JWTManager(app)
+
+
+# --- NEW JIRA OAUTH 2.0 ENDPOINTS ---
+
+# The base URL for Jira's OAuth 2.0 authorization
+authorization_base_url = 'https://auth.atlassian.com/authorize'
+token_url = 'https://auth.atlassian.com/oauth/token'
+# The scopes we requested in the developer console
+jira_scopes = ['read:jira-work', 'read:jira-user', 'read:project:jira']
+
+@app.route('/api/jira/auth')
+# @jwt_required()
+def jira_auth():
+    """Step 1: Redirects the user to Jira to authorize the app."""
+
+    # Because this is a browser redirect, we can't use headers.
+    # We manually check for the JWT in the query string.
+    token = request.args.get('jwt')
+    if not token:
+        return "Missing auth token.", 401
+    try:
+        # This verifies the token is valid and not expired
+        decoded_token = decode_token(token)
+        # We can also store the user_id in the session to link the Jira token later
+        session['user_id_for_jira_auth'] = decoded_token['sub']
+    except Exception as e:
+        app.logger.error(f"Invalid JWT provided for Jira auth: {e}")
+        return "Invalid or expired auth token.", 401
+
+
+    jira_client_id = os.getenv('JIRA_CLIENT_ID')
+    redirect_uri = os.getenv('JIRA_REDIRECT_URI')
+    
+    # Create an OAuth2 session object
+    oauth = OAuth2Session(jira_client_id, redirect_uri=redirect_uri, scope=jira_scopes)
+    
+    # Generate the authorization URL
+    authorization_url, state = oauth.authorization_url(
+        authorization_base_url,
+        audience='api.atlassian.com'
+    )
+    
+    # Store the state in the user's session to prevent CSRF attacks
+    session['oauth_state'] = state
+    
+    # Redirect the user's browser to the Jira authorization page
+    return redirect(authorization_url)
+
+
+@app.route('/api/jira/callback')
+def jira_callback():
+    """Step 2: Handles the callback from Jira after authorization."""
+    jira_client_id = os.getenv('JIRA_CLIENT_ID')
+    client_secret = os.getenv('JIRA_CLIENT_SECRET')
+    redirect_uri = os.getenv('JIRA_REDIRECT_URI')
+
+    # Create the session object, ensuring the state matches
+    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+
+    
+    try:
+        oauth = OAuth2Session(jira_client_id, state=session.get('oauth_state'), redirect_uri=redirect_uri)
+        token = oauth.fetch_token(token_url, client_secret=client_secret, authorization_response=request.url)
+        
+        # Get the user ID we stored in the session before the redirect
+        user_id = session.get('user_id_for_jira_auth')
+        if user_id:
+            # --- SAVE TOKEN TO DATABASE ---
+            user = User.objects.get(id=user_id)
+            user.jira_oauth_token = token # Store the entire token object
+            user.save()
+            app.logger.info(f"Successfully stored Jira OAuth token for user {user_id} in the database.")
+        else:
+            app.logger.warning("Could not find user_id in session after Jira callback.")
+
+    except Exception as e:
+        app.logger.error(f"Error in Jira callback: {e}", exc_info=True)
+        # Redirect to frontend with an error message if something goes wrong
+        return redirect('http://localhost:3000/?error=jira_auth_failed')
+    finally:
+        # Clean up the session variable and the insecure transport flag
+        session.pop('user_id_for_jira_auth', None)
+        session.pop('oauth_state', None)
+        os.environ.pop('OAUTHLIB_INSECURE_TRANSPORT', None)
+
+    # Redirect back to the main frontend page
+    return redirect('http://localhost:3000/')
+
+
+def get_jira_oauth_session():
+    """
+    Helper to create an authenticated session by fetching the token from the logged-in user's DB record.
+    """
+    try:
+        # Get the current user's ID from their JWT token
+        current_user_id = get_jwt_identity()
+        user = User.objects.get(id=current_user_id)
+        
+        # Check if the user has a Jira token saved
+        if not user.jira_oauth_token:
+            return None
+            
+        jira_client_id = os.getenv('JIRA_CLIENT_ID')
+        client_secret = os.getenv('JIRA_CLIENT_SECRET')
+        token = user.jira_oauth_token
+
+        # Define a function that will be called to auto-refresh the token if it's expired
+        def token_saver(new_token):
+            app.logger.info(f"Jira token refreshed for user {user.id}. Saving new token to DB.")
+            user.jira_oauth_token = new_token
+            user.save()
+
+        # Create the OAuth2Session with the token and auto-refresh capabilities
+        return OAuth2Session(
+            client_id=jira_client_id,
+            token=token,
+            auto_refresh_url=token_url,
+            auto_refresh_kwargs={
+                'client_id': jira_client_id,
+                'client_secret': client_secret,
+            },
+            token_updater=token_saver
+        )
+    except Exception as e:
+        app.logger.error(f"Error creating Jira OAuth session: {e}")
+        return None
+
 
 # --- Configuration ---
 UPLOAD_ALLOWED_EXTENSIONS = {'pdf', 'docx', 'zip'}
@@ -33,27 +177,69 @@ except Exception as e:
     app.logger.error(f"Failed to connect to MongoDB Atlas: {e}", exc_info=True)
 
 
-class TestCaseGeneration(Document):
-    """Represents a single event of generating a batch of test cases."""
-    source_type = StringField(max_length=50) # e.g., 'Text Input', 'File: req.pdf', 'Image ZIP'
-    test_case_count = IntField(default=0)
+class User(Document):
+    username = StringField(required=True, unique=True)
+    email = StringField(required=True, unique=True)
+    password = StringField(required=True)
     created_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
-    
-    # This will store the DB IDs of the test cases created in this batch
-    test_case_ids = ListField(ReferenceField('TestCase'))
+    # We use DynamicField because the token object contains 'access_token',
+    # 'refresh_token', 'expires_in', etc.
+    jira_oauth_token = DynamicField()
 
-    meta = {'collection': 'test_case_generations'}
+    meta = {'collection': 'users'}
 
     def to_dict(self):
-        return {
-            "id": str(self.id),
-            "source_type": self.source_type,
-            "test_case_count": self.test_case_count,
-            "created_at": self.created_at.isoformat()
-        }
+        """Converts User document to a JSON-serializable dictionary."""
+        data = self.to_mongo().to_dict()
+        # IMPORTANT: Convert the primary key _id from ObjectId to a string
+        data['id'] = str(data.pop('_id'))
+        # Remove the password for security
+        data.pop('password', None)
+        # Convert datetime to string
+        if 'created_at' in data and isinstance(data['created_at'], datetime):
+            data['created_at'] = data['created_at'].isoformat()
+        return data
+
+
+class Project(Document):
+    name = StringField(required=True, max_length=150)
+    github_repo_url = StringField()
+    user = ReferenceField('User', required=True) # The link to the user
+    created_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
+    meta = {'collection': 'projects'}
+
+
+class TestCaseGeneration(Document): 
+    project = ReferenceField('Project', required=True) # The field name is 'project'
+    source_type = StringField(max_length=100)
+    source_jira_issues = ListField(StringField())
+    test_case_count = IntField(default=0)
+    created_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
+    test_case_ids = ListField(ReferenceField('TestCase'))
+    meta = {'collection': 'test_case_generations'}
+    def to_dict(self):
+        """Converts TestCaseGeneration document to a JSON-serializable dictionary."""
+        data = self.to_mongo().to_dict()
+        data['id'] = str(data.pop('_id')) # Convert main ID
+
+        # Convert the project ReferenceField ObjectId to a string
+        if 'project' in data and isinstance(data['project'], ObjectId):
+            data['project'] = str(data['project'])
+
+        # Convert the list of test_case_ids from ObjectIds to strings
+        if 'test_case_ids' in data:
+            data['test_case_ids'] = [str(oid) for oid in data['test_case_ids']]
+
+        if 'created_at' in data and isinstance(data['created_at'], datetime):
+            data['created_at'] = data['created_at'].isoformat()
+            
+        return data
 
 
 class TestCase(Document):
+    project = ReferenceField('Project', required=True) # The field name is 'project'
+    generation_event = ReferenceField('TestCaseGeneration')
+    source_jira_issue_key = StringField(max_length=20)
     case_id_string = StringField(max_length=50) # e.g., TC-LOGIN-01
     scenario = StringField(required=True, max_length=255)
     summary = StringField(required=True)
@@ -65,35 +251,41 @@ class TestCase(Document):
     severity = StringField(max_length=20)
     created_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
     
-    generation_event = ReferenceField('TestCaseGeneration')
     # MongoEngine uses 'id' for the primary key (_id in the DB)
     meta = {'collection': 'test_cases'}
 
     def to_dict(self):
-        # Convert the document to a dictionary
+        """Converts TestCase document to a JSON-serializable dictionary."""
         data = self.to_mongo().to_dict()
-        # Convert the main ObjectId to a string for JSON serialization
+
+        # Convert the main _id ObjectId to a string
         data['id'] = str(data.pop('_id'))
 
-        # Convert the generation_event ObjectId to a string if it exists
+        # --- THIS IS THE CRITICAL FIX ---
+        # Convert the generation_event ReferenceField ObjectId to a string if it exists
         if 'generation_event' in data and isinstance(data['generation_event'], ObjectId):
             data['generation_event'] = str(data['generation_event'])
+    
+        # Convert the project ReferenceField ObjectId to a string if it exists
+        if 'project' in data and isinstance(data['project'], ObjectId):
+            data['project'] = str(data['project'])
+        # --- END OF FIX ---
 
         # Convert datetime to an ISO format string
         if 'created_at' in data and isinstance(data['created_at'], datetime):
             data['created_at'] = data['created_at'].isoformat()
-
-        # Match the frontend's expected keys
-        data['test_steps_json'] = data.pop('test_steps', [])
-        data['test_data_json'] = data.pop('test_data', None)
-         # The 'summary' field is already a string, so we just ensure test_case_summary exists too
-        data['summary'] = data.get('summary', '')
-        data['test_case_summary'] = data.get('summary', '')
+    
+        # Match the frontend's expected keys for easier rendering
+        data['test_steps_json'] = data.get('test_steps', [])
+        data['test_data_json'] = data.get('test_data', None)
+        data['summary'] = data.get('summary', '') # Keep original field name
+        data['test_case_summary'] = data.get('summary', '') # Add alias for compatibility
 
         return data
 
 class AiAnalysis(Document):
     analysis_type = StringField(required=True, choices=['defect', 'automation', 'impact'])
+    project = ReferenceField('Project', required=True) # The field name is 'project'
     source_info = StringField(max_length=255)
     analysis_json = DynamicField(required=True) # The structured AI JSON response
     created_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
@@ -127,6 +319,26 @@ def truncate_text(text: str, max_length: int) -> str:
         return text[:max_length]
     return text
 
+
+def _verify_project_ownership(project_id: str, user_id: str):
+    """Checks if a user owns a project using MongoEngine. Aborts if not."""
+    try:
+        # Find the project by its ID
+        project = Project.objects.get(id=project_id, user=user_id)
+        # Check if the project's user ID matches the logged-in user's ID
+        if str(project.user.id) != user_id:
+            raise Forbidden("You do not have permission to access this project.")
+        # If the check passes, return the project object for potential reuse
+        return project
+    except Project.DoesNotExist:
+        # If the project doesn't exist at all
+        raise NotFound("Project not found.")
+    except Exception as e:
+        # Catch other potential errors like invalid ID format
+        app.logger.error(f"Error during ownership verification: {e}")
+        raise Forbidden("Invalid project ID or permission error.")
+
+
 # --- NEW/MODIFIED HELPER FUNCTIONS FOR JSON HANDLING ---
 
 def _clean_ai_response_for_json(ai_response_text: str) -> str:
@@ -148,7 +360,7 @@ def _clean_ai_response_for_json(ai_response_text: str) -> str:
 def _generate_json_test_case_prompt(content_source_description: str, extracted_content: str, is_figma: bool = False) -> str:
     """
     MODIFIED Helper to create a more detailed and structured JSON prompt for test cases.
-    It now groups test cases by scenario and is more demanding about depth.
+    It now groups test cases by scenario and is more demanding about depth and detail.
     """
     specialized_intro = "specializing in UI/UX testing" if is_figma else ""
     specialized_focus = "Focus on interactions, visual elements, navigation, and edge cases." if is_figma else "Identify requirements, features, and user actions. Cover all positive, negative, and boundary conditions."
@@ -173,40 +385,40 @@ def _generate_json_test_case_prompt(content_source_description: str, extracted_c
     - "severity": (string, one of: "High", "Medium", "Low") - High being most critical failure.
 
     Return the output strictly as a JSON array of these "scenario" objects. Do not include any introductory text, concluding text, or markdown formatting (like ```json) outside of the JSON array itself.
+    
     CRITICAL INSTRUCTION: Ensure the entire response is a single, complete, and valid JSON array. Do not truncate the output. If the content is long, focus on the most critical scenarios first but ensure the JSON structure is perfectly valid and complete.
 
-    
     Example of the required detail and structure:
     [
       {{
-        "scenario_title": "Book Management: Add New Book",
+        "scenario_title": "User Registration: Email Field Validation",
         "positive_test_cases": [
           {{
-            "id": "TC-ADD-POS-01",
-            "test_case_summary": "Add a new book with all valid data, including all optional fields.",
-            "test_steps": ["Navigate to 'Add Book'", "Fill all fields with valid data including optional notes", "Click Save"],
-            "test_data": ["ISBN: 9780123456789", "Title: A Valid Book", "Notes: First edition copy."],
-            "expected_result": "Success message is shown. Book appears in inventory with all data saved correctly.",
+            "id": "TC-REG-POS-01",
+            "test_case_summary": "Register with a valid, standard email address.",
+            "test_steps": ["Navigate to registration page", "Enter 'test@example.com' in email field", "Fill other required fields", "Click 'Register'"],
+            "test_data": ["Email: test@example.com"],
+            "expected_result": "Registration is successful. User is logged in or receives a confirmation email.",
             "priority": "P1",
             "severity": "High"
           }}
         ],
         "negative_test_cases": [
           {{
-            "id": "TC-ADD-NEG-01",
-            "test_case_summary": "Attempt to add a book with a duplicate ISBN.",
-            "test_steps": ["Navigate to 'Add Book'", "Enter an ISBN that already exists in the system", "Fill other fields", "Click Save"],
-            "test_data": ["ISBN: 9780000000001 (known duplicate)"],
-            "expected_result": "An inline error message 'ISBN already exists' is displayed. The form is not submitted.",
+            "id": "TC-REG-NEG-01",
+            "test_case_summary": "Attempt to register with an email missing the '@' symbol.",
+            "test_steps": ["Navigate to registration page", "Enter 'test.example.com' in email field", "Fill other fields", "Click 'Register'"],
+            "test_data": ["Email: test.example.com"],
+            "expected_result": "An inline validation error message 'Please enter a valid email address' is displayed next to the email field.",
             "priority": "P1",
             "severity": "High"
           }},
           {{
-            "id": "TC-ADD-NEG-02",
-            "test_case_summary": "Attempt to add a book with an empty required 'Title' field.",
-            "test_steps": ["Navigate to 'Add Book'", "Leave the 'Title' field empty", "Fill other required fields", "Click Save"],
-            "test_data": ["Title: (empty)"],
-            "expected_result": "A validation error message appears next to the 'Title' field, indicating it cannot be empty.",
+            "id": "TC-REG-NEG-02",
+            "test_case_summary": "Attempt to register with an empty email field.",
+            "test_steps": ["Navigate to registration page", "Leave the email field empty", "Fill other required fields", "Click 'Register'"],
+            "test_data": ["Email: (empty)"],
+            "expected_result": "A validation error 'Email address is required' is displayed.",
             "priority": "P1",
             "severity": "Medium"
           }}
@@ -317,8 +529,396 @@ def _handle_ai_json_object_response_internal(ai_response_text: str):
 # --- API Endpoints ---
 
 
-@app.route('/api/analyze-defect', methods=['POST'])
-def analyze_defect_endpoint():
+@app.route('/api/project/<string:project_id>/generate-test-cases', methods=['POST'])
+@jwt_required()
+def generate_test_cases_endpoint(project_id):
+    current_user_id = get_jwt_identity()
+    project = _verify_project_ownership(project_id, current_user_id)
+
+    data = request.get_json()
+    requirements_text = data.get('requirements_text')
+    source_description = data.get('source_description', 'Manual Input')
+    # NEW: Get the list of Jira issues if they exist
+    jira_issues = data.get('jira_issues', []) # Expects a list of objects [{key, summary}, ...]
+
+    if not requirements_text or not requirements_text.strip():
+        return create_response(error="Requirements text cannot be empty.", status_code=400)
+
+    try:
+        prompt = _generate_json_test_case_prompt(source_description, requirements_text)
+        ai_response_text = generate_text([prompt])
+        parsed_result = _handle_ai_json_response_internal(ai_response_text, expects_array=True)
+
+        if "error" in parsed_result:
+            return create_response({ "suggestions": parsed_result.get("raw_text"), "source": source_description, "warning": parsed_result.get("warning") }, status_code=200)
+
+        # --- DATABASE LOGIC ---
+        suggestions_list = parsed_result.get("data", [])
+        all_tcs_flat = get_flattened_tcs_backend(suggestions_list)
+        
+        if not all_tcs_flat:
+            return create_response({"suggestions": [], "source": source_description})
+
+        generation_event = TestCaseGeneration(
+            project=project,
+            source_type=source_description,
+            # NEW: Save the keys of the Jira issues used
+            source_jira_issues=[issue.get('key') for issue in jira_issues],
+            test_case_count=len(all_tcs_flat)
+        )
+        generation_event.save()
+
+        saved_test_cases = []
+        for tc_data in all_tcs_flat:
+            new_case = TestCase(
+                project=project,
+                generation_event=generation_event,
+                case_id_string=tc_data.get('id'),
+                scenario=tc_data.get('scenario_title') or tc_data.get('scenario'),
+                summary=tc_data.get('test_case_summary'),
+                pre_condition=tc_data.get('pre_condition'),
+                test_steps=tc_data.get('test_steps', []),
+                test_data=tc_data.get('test_data', {}),
+                expected_result=tc_data.get('expected_result'),
+                priority=tc_data.get('priority'),
+                severity=tc_data.get('severity')
+            )
+            new_case.save()
+            saved_test_cases.append(new_case)
+        
+        generation_event.test_case_ids = [case.id for case in saved_test_cases]
+        generation_event.save()
+        
+        app.logger.info(f"Saved Gen Event {generation_event.id} with {len(saved_test_cases)} test cases.")
+        
+        saved_test_cases_dicts = [case.to_dict() for case in saved_test_cases]
+        return create_response({"suggestions": saved_test_cases_dicts, "source": source_description})
+
+    except Exception as e:
+        app.logger.error(f"Error in generate_test_cases_endpoint: {e}", exc_info=True)
+        return create_response(error="Internal server error.", status_code=500)
+
+
+@app.route('/api/jira/projects', methods=['GET'])
+@jwt_required()
+def get_jira_projects():
+    """
+    Fetches projects using the stored OAuth 2.0 token. This is the definitive method.
+    """
+    # get_jira_oauth_session() is a helper that retrieves the token from the user's session
+    oauth_session = get_jira_oauth_session()
+    
+    # If the helper returns None, it means the user hasn't authenticated with Jira yet.
+    if not oauth_session:
+        # We return a 401 Unauthorized error with a specific message.
+        # The frontend will use this to show the "Connect to Jira" button.
+        return create_response(error="Jira not authenticated. Please connect to Jira.", status_code=401)
+        
+    try:
+        # Step 1: Discover which Jira sites the user has access to.
+        # An OAuth token is not tied to a single site, so we must ask first.
+        accessible_resources_url = 'https://api.atlassian.com/oauth/token/accessible-resources'
+        resources_response = oauth_session.get(accessible_resources_url)
+        resources_response.raise_for_status() # Check for errors
+        resources = resources_response.json()
+
+        if not resources:
+            app.logger.warning("OAuth successful, but no accessible Jira sites (cloudId) found for this user.")
+            return create_response([]) # Return empty list, not an error
+
+        # Step 2: Assume we use the first accessible site found.
+        # In a multi-site enterprise app, you might let the user choose.
+        cloud_id = resources[0]['id']
+        
+        # Step 3: Use the cloudId to fetch the projects for that specific site.
+        projects_url = f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/project"
+        projects_response = oauth_session.get(projects_url)
+        projects_response.raise_for_status()
+        projects_data = projects_response.json()
+
+        # The project data is a direct list in this API response
+        project_list = [{"key": p.get("key"), "name": p.get("name")} for p in projects_data]
+        
+        app.logger.info(f"Successfully fetched {len(project_list)} projects for cloudId {cloud_id} via OAuth.")
+        return create_response(project_list)
+        
+    except Exception as e:
+        app.logger.error(f"Error fetching Jira projects via OAuth: {e}", exc_info=True)
+        # Clear the potentially bad token from the session so the user can re-authenticate
+        if 'jira_token' in session:
+            session.pop('jira_token')
+        return create_response(error="Could not fetch projects from Jira. Your connection may have expired. Please try connecting to Jira again.", status_code=500)
+
+
+
+@app.route('/api/jira/issues', methods=['POST'])
+@jwt_required()
+def get_jira_issues():
+    """
+    Fetches issues (Stories, Tasks, etc.) for a specific Jira project key using OAuth.
+    """
+    # Step 1: Get the authenticated OAuth session
+    oauth_session = get_jira_oauth_session()
+    if not oauth_session:
+        return create_response(error="Jira not authenticated. Please connect to Jira first.", status_code=401)
+    
+    data = request.get_json()
+    project_key = data.get('project_key')
+    if not project_key:
+        return create_response(error="Project key is required.", status_code=400)
+        
+    try:
+        # Step 2: Discover the cloudId for the user's Jira site
+        accessible_resources_url = 'https://api.atlassian.com/oauth/token/accessible-resources'
+        resources = oauth_session.get(accessible_resources_url).json()
+        if not resources:
+            raise Exception("No accessible Jira sites found for this user.")
+        
+        cloud_id = resources[0]['id']
+        
+        # Step 3: Build the JQL query and the API URL
+        jql_query = f"project = '{project_key}' ORDER BY created DESC"
+        search_url = f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/search"
+        
+        payload = {
+            "jql": jql_query,
+            "maxResults": 50, # Limit results for performance
+            "fields": [ # Specify only the fields we need to be efficient
+                "summary",
+                "description",
+                "issuetype"
+            ]
+        }
+
+        app.logger.info(f"Searching Jira issues with JQL: {jql_query}")
+        
+        # Step 4: Make the POST request to the search endpoint
+        search_response = oauth_session.post(search_url, json=payload)
+        search_response.raise_for_status()
+        search_data = search_response.json()
+
+        # Step 5: Format the results for the frontend
+        issue_list = []
+        for issue in search_data.get("issues", []):
+            fields = issue.get("fields", {})
+            issue_list.append({
+                "key": issue.get("key"),
+                "summary": fields.get("summary"),
+                "description": fields.get("description") or "", # Ensure description is a string
+                "issue_type": fields.get("issuetype", {}).get("name")
+            })
+            
+        app.logger.info(f"Successfully fetched {len(issue_list)} issues for project {project_key}.")
+        return create_response(issue_list)
+        
+    except Exception as e:
+        app.logger.error(f"Error fetching Jira issues via OAuth for project {project_key}: {e}", exc_info=True)
+        # Clear the potentially bad token from the session so the user can re-authenticate
+        if 'jira_token' in session:
+            session.pop('jira_token')
+        return create_response(error="Could not fetch issues from Jira. Your connection may have expired. Please try connecting to Jira again.", status_code=500)
+    
+
+
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    """Registers a new user."""
+    data = request.get_json()
+    username = data.get('username')
+    email = data.get('email')
+    password = data.get('password')
+
+    if not username or not email or not password:
+        return create_response(error="Username, email, and password are required.", status_code=400)
+
+    # Check if user already exists using MongoEngine syntax
+    if User.objects(email=email).first():
+        return create_response(error="Email address already in use.", status_code=409)
+    if User.objects(username=username).first():
+        return create_response(error="Username is already taken.", status_code=409)
+
+    # Hash the password
+    hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
+
+    # Create and save the new user document
+    new_user = User(
+        username=username,
+        email=email,
+        password=hashed_password
+    )
+    new_user.save()
+
+    app.logger.info(f"New user registered: {email}, ID: {new_user.id}")
+    return create_response({"message": "User registered successfully."}, status_code=201)
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    """Logs in a user and returns a JWT access token."""
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
+    if not email or not password:
+        return create_response(error="Email and password are required.", status_code=400)
+
+    user = User.objects(email=email).first() # Use MongoEngine syntax
+
+    if user and bcrypt.check_password_hash(user.password, password):
+        access_token = create_access_token(identity=str(user.id))
+        app.logger.info(f"User logged in successfully: {email}")
+        return create_response({"access_token": access_token})
+    else:
+        app.logger.warning(f"Failed login attempt for email: {email}")
+        return create_response(error="Invalid credentials.", status_code=401)
+
+
+@app.route('/api/auth/profile', methods=['GET'])
+@jwt_required()
+def profile():
+    """Returns the profile of the currently logged-in user."""
+    current_user_id = get_jwt_identity()
+    try:
+        user = User.objects.get(id=current_user_id)
+        
+        # Now, we use the model's own to_dict() method, which handles all conversions and removes the password
+        return create_response(user.to_dict())
+
+    except User.DoesNotExist:
+        return create_response(error="User not found.", status_code=404)
+    except Exception as e:
+        app.logger.error(f"Error fetching profile for user_id {current_user_id}: {e}", exc_info=True)
+        return create_response(error="Error fetching profile.", status_code=500)
+
+# Authentication
+@app.route('/api/projects', methods=['POST'])
+@jwt_required()
+def create_project():
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+    name = data.get('name')
+
+    if not name or not name.strip():
+        return create_response(error="Project name is required.", status_code=400)
+
+    try:
+        # Create a new Project document, linking it to the current user
+        new_project = Project(
+            user=current_user_id, # MongoEngine handles resolving the User document from the ID
+            name=name.strip(),
+            github_repo_url=data.get('github_repo_url', '').strip()
+        )
+        new_project.save()
+
+        app.logger.info(f"User {current_user_id} created new project: {name}")
+        
+        # Prepare response data
+        response_data = {
+            "_id": str(new_project.id),
+            "name": new_project.name,
+            "github_repo_url": new_project.github_repo_url
+        }
+        return create_response(response_data, status_code=201)
+    except Exception as e:
+        app.logger.error(f"Error creating project: {e}", exc_info=True)
+        return create_response(error="Failed to create project.", status_code=500)
+    
+
+@app.route('/api/projects', methods=['GET'])
+@jwt_required()
+def get_projects():
+    current_user_id = get_jwt_identity()
+    
+    try:
+        # Find all projects where the 'user' field matches the current user's ID
+        user_projects = Project.objects(user=current_user_id).order_by('-created_at')
+
+        project_list = []
+        for project in user_projects:
+            project_list.append({
+                "_id": str(project.id),
+                "name": project.name,
+                "github_repo_url": project.github_repo_url
+            })
+            
+        app.logger.info(f"User {current_user_id} fetched {len(project_list)} projects.")
+        return create_response(project_list)
+    except Exception as e:
+        app.logger.error(f"Error fetching projects for user {current_user_id}: {e}", exc_info=True)
+        return create_response(error="Failed to fetch projects.", status_code=500)
+    
+
+@app.route('/api/projects/<string:project_id>', methods=['GET'])
+@jwt_required()
+def get_project_details(project_id):
+    """
+    Fetches all data associated with a single project, including its
+    test cases, analyses, and dashboard stats.
+    """
+    current_user_id = get_jwt_identity()
+    # This verifies ownership and returns the project object if successful
+    project = _verify_project_ownership(project_id, current_user_id) 
+
+    try:
+        # --- GATHER ALL DATA FOR THIS PROJECT ---
+        
+        # 1. Dashboard Stats (using the correct field name 'project')
+        total_test_cases = TestCase.objects(project=project_id).count()
+        total_defect_analyses = AiAnalysis.objects(project=project_id, analysis_type='defect').count()
+        total_automation_analyses = AiAnalysis.objects(project=project_id, analysis_type='automation').count()
+        
+        # For raw aggregation pipelines, we still need to convert the string ID to an ObjectId
+        project_oid = ObjectId(project_id)
+        pipeline = [
+            { "$match": { "project": project_oid, "severity": { "$ne": None, "$ne": "" } } },
+            { "$group": { "_id": "$severity", "count": { "$sum": 1 } } },
+            { "$sort": { "_id": 1 } }
+        ]
+        severity_distribution = list(TestCase.objects.aggregate(pipeline))
+        
+        severity_chart_data = {
+            'labels': [item['_id'] for item in severity_distribution],
+            'data': [item['count'] for item in severity_distribution]
+        }
+        
+        recent_analyses = AiAnalysis.objects(project=project_id).order_by('-created_at').limit(5)
+        recent_generations = TestCaseGeneration.objects(project=project_id).order_by('-created_at').limit(5)
+        
+        dashboard_stats = {
+            "key_metrics": {
+                "total_test_cases": total_test_cases,
+                "total_defect_analyses": total_defect_analyses,
+                "total_automation_analyses": total_automation_analyses
+            },
+            "severity_chart": severity_chart_data,
+            "recent_analyses": [analysis.to_dict() for analysis in recent_analyses],
+            "recent_generations": [gen.to_dict() for gen in recent_generations]
+        }
+
+        # 2. All Test Cases for this project
+        all_test_cases = TestCase.objects(project=project_id).order_by('-created_at')
+        
+        # 3. Assemble the final response
+        project_details_data = {
+            "id": str(project.id),
+            "name": project.name,
+            "github_repo_url": project.github_repo_url,
+            "dashboard_stats": dashboard_stats,
+            "test_cases": [tc.to_dict() for tc in all_test_cases]
+            # You can add a list of all analyses here too if needed for the UI
+        }
+        
+        return create_response(project_details_data)
+
+    except Exception as e:
+        app.logger.error(f"Error fetching details for project {project_id}: {e}", exc_info=True)
+        return create_response(error="Could not retrieve project details.", status_code=500)
+
+
+@app.route('/api/project/<string:project_id>/analyze-defect', methods=['POST'])
+@jwt_required()
+def analyze_defect_endpoint(project_id):
+    current_user_id = get_jwt_identity()
+    project = _verify_project_ownership(project_id, current_user_id)  # Verify ownership
     """
     Analyzes defect information using Gemini and saves the result to MongoDB.
     """
@@ -349,7 +949,7 @@ def analyze_defect_endpoint():
     """
     try:
         ai_response_text = generate_text([prompt])
-        result = _handle_ai_json_object_response_internal(ai_response_text, source_info_text)
+        result = _handle_ai_json_object_response_internal(ai_response_text)
 
         analysis_to_save = {}
         is_fallback = False
@@ -361,6 +961,7 @@ def analyze_defect_endpoint():
             analysis_to_save = result["data"]
 
         new_analysis = AiAnalysis(
+            project=project,
             analysis_type='defect',
             source_info=source_info_text,
             analysis_json=analysis_to_save
@@ -379,34 +980,35 @@ def analyze_defect_endpoint():
         return create_response(error="Failed to generate defect analysis due to an internal server error.", status_code=500)
 
 
-@app.route('/api/dashboard-stats', methods=['GET'])
-def get_dashboard_stats():
-    """Gathers and returns statistics for the main dashboard from MongoDB."""
+@app.route('/api/project/<string:project_id>/dashboard-stats', methods=['GET'])
+@jwt_required()
+def get_dashboard_stats(project_id):
+    current_user_id = get_jwt_identity()
+    project = _verify_project_ownership(project_id, current_user_id)
+    project=project_id
+
     try:
-        # 1. Key Metrics
-        total_test_cases = TestCase.objects.count()
-        total_automation_analyses = AiAnalysis.objects(analysis_type='automation').count()
-        total_defect_analyses = AiAnalysis.objects(analysis_type='defect').count()
-        
-        # 2. Test Case Severity Chart Data using an aggregation pipeline
+        # --- CORRECTED QUERIES ---
+        total_test_cases = TestCase.objects(project=project_id).count()
+        total_automation_analyses = AiAnalysis.objects(project=project_id, analysis_type='automation').count()
+        total_defect_analyses = AiAnalysis.objects(project=project_id, analysis_type='defect').count()
+
         pipeline = [
-            { "$match": { "severity": { "$ne": None, "$ne": "" } } }, # Exclude null and empty strings
+            { "$match": { "project_id":  ObjectId(project_id), "severity": { "$ne": None, "$ne": "" } } },
             { "$group": { "_id": "$severity", "count": { "$sum": 1 } } },
             { "$sort": { "_id": 1 } }
         ]
         severity_distribution = list(TestCase.objects.aggregate(pipeline))
+
+        recent_analyses = AiAnalysis.objects(project=project_id).order_by('-created_at').limit(5)
+        recent_generations = TestCaseGeneration.objects(project=project_id).order_by('-created_at').limit(5)
+        # --- END OF CORRECTIONS ---
         
         severity_chart_data = {
             'labels': [item['_id'] for item in severity_distribution],
             'data': [item['count'] for item in severity_distribution]
         }
-
-        # NEW: Fetch recent Test Case Generation events
-        recent_generations = TestCaseGeneration.objects.order_by('-created_at').limit(5)
         recent_generations_dicts = [gen.to_dict() for gen in recent_generations]
-
-        # 3. Recent AI Analyses
-        recent_analyses = AiAnalysis.objects.order_by('-created_at').limit(5)
         recent_analyses_dicts = [analysis.to_dict() for analysis in recent_analyses]
         
         dashboard_data = {
@@ -420,7 +1022,6 @@ def get_dashboard_stats():
             "recent_generations": recent_generations_dicts
         }
         
-        app.logger.info("Successfully fetched dashboard stats.")
         return create_response(dashboard_data)
 
     except Exception as e:
@@ -429,8 +1030,12 @@ def get_dashboard_stats():
 
 
 #This endpoint will receive a list of existing test cases and return a list of IDs for those that should be automated
-@app.route('/api/analyze-for-automation', methods=['POST'])
-def analyze_for_automation_endpoint():
+@app.route('/api/project/<string:project_id>/analyze-for-automation', methods=['POST'])
+@jwt_required()
+def analyze_for_automation_endpoint(project_id):
+    current_user_id = get_jwt_identity()
+    project = _verify_project_ownership(project_id, current_user_id)  # Verify ownership
+
     """
     Analyzes a list of test cases and suggests which are good candidates for automation.
     Expects JSON: { "test_cases": [ { "id": "...", "test_case_summary": "...", "test_steps": [...] }, ... ] }
@@ -487,116 +1092,11 @@ def health_check():
     return create_response({"status": "Backend is running"})
 
 
-# @app.route('/api/suggest-test-cases-from-images', methods=['POST'])
-# def suggest_test_cases_from_images_endpoint():
-#     app.logger.info("Received request for /api/suggest-test-cases-from-images")
-#     if 'file' not in request.files: return create_response(error="No file part in request", status_code=400)
-    
-#     file = request.files['file']
-#     if file.filename == '': return create_response(error="No selected file", status_code=400)
-    
-#     if file and get_file_extension(file.filename) == 'zip':
-#         original_filename = secure_filename(file.filename)
-#         source_description = f"Image ZIP: {original_filename}"
-        
-#         try:
-#             images_data = process_zip_file_for_images(file.stream)
-#             if not images_data:
-#                 return create_response(error="No supported images (PNG/JPG) found in the ZIP file.", status_code=400)
-#             app.logger.info(f"Extracted {len(images_data)} images from ZIP file.")
-            
-#             prompt_text = """
-#             Act as an expert Software Quality Assurance Engineer specializing in UI/UX testing.
-#             Analyze the following user interface screenshots. Based on the visual elements, layout, and text visible in these images, generate a flat list of detailed test cases.
-
-#             For each test case, provide the following details as key-value pairs:
-#             - "id": (string) A unique identifier like TC-UI-01.
-#             - "scenario": (string) The name of the screen or component being tested (e.g., "Login Screen", "Contact Form").
-#             - "type": (string, one of: "Positive" or "Negative") The nature of the test.
-#             - "test_case_summary": (string) A concise description of the specific test.
-#             - "test_steps": (array of strings) The actions to perform.
-#             - "test_data": (array of strings) Example data used, if any.
-#             - "expected_result": (string) The expected visual or functional outcome.
-#             - "priority": (string, one of: "P1", "P2", "P3").
-#             - "severity": (string, one of: "High", "Medium", "Low").
-
-#             CRITICAL INSTRUCTION: Ensure the entire response is a single, complete, and valid JSON array. Do not truncate the output. Prioritize quality and completeness of the JSON structure.
-#             Return the output strictly as a single JSON array of these test case objects. Do NOT include any text outside the JSON array.
-#             """ 
-
-#             prompt_parts = [prompt_text]
-#             for img_data in images_data:
-#                 prompt_parts.append(f"Analyzing image: {img_data['filename']}")
-#                 prompt_parts.append(img_data['image'])
-            
-#             ai_response_text = generate_text(prompt_parts)
-#             parsed_result = _handle_ai_json_response_internal(ai_response_text) # expects_array is default True
-
-#             if "error" in parsed_result:
-#                 return create_response({
-#                     "suggestions": parsed_result.get("raw_text"),
-#                     "source": source_description,
-#                     "warning": parsed_result.get("warning")
-#                 }, status_code=200)
-
-#             # --- MODIFIED DATABASE LOGIC ---
-#             suggestions_list = parsed_result.get("data", []) # This list is already flat
-#             if not suggestions_list:
-#                 app.logger.info("AI returned no test cases to save from image input.")
-#                 return create_response({"suggestions": [], "source": source_description})
-
-#             # 1. Create the parent TestCaseGeneration event
-#             generation_event = TestCaseGeneration(
-#                 source_type=source_description,
-#                 test_case_count=len(suggestions_list)
-#             )
-#             generation_event.save()
-
-#             # 2. Create and link each TestCase
-#             saved_test_cases = []
-#             for tc_data in suggestions_list:
-#                 new_case = TestCase(
-#                     generation_event=generation_event, # <-- Link to the event
-#                     case_id_string=tc_data.get('id'),
-#                     scenario=tc_data.get('scenario'),
-#                     summary=tc_data.get('test_case_summary'),
-#                     pre_condition=tc_data.get('pre_condition'),
-#                     test_steps=tc_data.get('test_steps', []),
-#                     test_data=tc_data.get('test_data', {}),
-#                     expected_result=tc_data.get('expected_result'),
-#                     priority=tc_data.get('priority'),
-#                     severity=tc_data.get('severity')
-#                     # Note: We also pass 'type' from the AI response to the frontend via to_dict if needed, but it's not a DB field
-#                 )
-#                 new_case.save()
-#                 saved_test_cases.append(new_case)
-            
-#             # 3. (Optional) Update the event with the saved test case IDs
-#             generation_event.test_case_ids = [case.id for case in saved_test_cases]
-#             generation_event.save()
-            
-#             app.logger.info(f"Saved TestCaseGeneration event {generation_event.id} with {len(saved_test_cases)} test cases from image ZIP.")
-            
-#             # 4. Prepare and return the response
-#             saved_test_cases_dicts = [case.to_dict() for case in saved_test_cases]
-#             # Add the 'type' back in for the frontend grouping helper
-#             for i, tc_dict in enumerate(saved_test_cases_dicts):
-#                 tc_dict['type'] = suggestions_list[i].get('type')
-                
-#             return create_response({"suggestions": saved_test_cases_dicts, "source": source_description})
-            
-#         except (ValueError, IOError) as e:
-#             app.logger.error(f"Error processing ZIP file {original_filename}: {e}")
-#             return create_response(error=str(e), status_code=400)
-#         except Exception as e:
-#             app.logger.error(f"Unexpected error processing image ZIP: {e}", exc_info=True)
-#             return create_response(error="An internal server error occurred while processing the images.", status_code=500)
-#     else:
-#         return create_response(error="File type not allowed. Please upload a ZIP file.", status_code=400)
-
-
-@app.route('/api/suggest-test-cases-from-images', methods=['POST'])
-def suggest_test_cases_from_images_endpoint():
+@app.route('/api/project/<string:project_id>/suggest-test-cases-from-images', methods=['POST'])
+@jwt_required()
+def suggest_test_cases_from_images_endpoint(project_id):
+    current_user_id = get_jwt_identity()
+    project = _verify_project_ownership(project_id, current_user_id)  # Verify ownership
     app.logger.info("Received request for /api/suggest-test-cases-from-images")
     if 'file' not in request.files: return create_response(error="No file part in request", status_code=400)
     
@@ -648,6 +1148,7 @@ def suggest_test_cases_from_images_endpoint():
             saved_test_cases = []
             for tc_data in suggestions_list:
                 new_case = TestCase(
+                    project=project,
                     generation_event=generation_event,
                     case_id_string=tc_data.get('id'),
                     scenario=tc_data.get('scenario'),
@@ -682,8 +1183,12 @@ def suggest_test_cases_from_images_endpoint():
 
 # --- Test Case Suggestion Endpoints (MODIFIED TO USE JSON HANDLERS) ---
 
-@app.route('/api/suggest-test-cases', methods=['POST'])
-def suggest_test_cases_from_text_endpoint():
+@app.route('/api/project/<string:project_id>/suggest-test-cases', methods=['POST'])
+@jwt_required()
+def suggest_test_cases_from_text_endpoint(project_id):
+    current_user_id = get_jwt_identity()
+    project = _verify_project_ownership(project_id, current_user_id) # Verify ownership
+
     app.logger.info("Received request for /api/suggest-test-cases (text input)")
     data = request.get_json()
     if not data or 'requirements' not in data or not data['requirements'].strip():
@@ -712,6 +1217,7 @@ def suggest_test_cases_from_text_endpoint():
             return create_response({"suggestions": [], "source": source_description})
 
         generation_event = TestCaseGeneration(
+            project=project,
             source_type=source_description,
             test_case_count=len(all_tcs_flat)
         )
@@ -720,6 +1226,7 @@ def suggest_test_cases_from_text_endpoint():
         saved_test_cases = []
         for tc_data in all_tcs_flat:
             new_case = TestCase(
+                project=project,
                 generation_event=generation_event,
                 case_id_string=tc_data.get('id'),
                 scenario=tc_data.get('scenario_title') or tc_data.get('scenario'),
@@ -747,15 +1254,23 @@ def suggest_test_cases_from_text_endpoint():
         return create_response(error="Internal server error.", status_code=500)
 
 
-@app.route('/api/test-case-generations/<string:generation_id>', methods=['DELETE'])
-def delete_test_case_generation(generation_id):
+@app.route('/api/project/<string:project_id>/test-case-generations/<string:generation_id>', methods=['DELETE'])
+@jwt_required()
+def delete_test_case_generation(project_id, generation_id):
     """Deletes a generation event and all associated test cases."""
-    app.logger.info(f"Received DELETE request for TestCaseGeneration ID: {generation_id}")
+    current_user_id = get_jwt_identity()
+    # This verifies the user owns the project and gives us the project object.
+    project = _verify_project_ownership(project_id, current_user_id)
+
+    app.logger.info(f"Received DELETE request for TestCaseGeneration ID: {generation_id} in Project {project_id}")
     try:
-        generation_event = TestCaseGeneration.objects.get(id=generation_id)
+        # --- THIS IS THE CRITICAL FIX ---
+        # Find the generation event by its ID AND ensure it belongs to the correct project.
+        generation_event = TestCaseGeneration.objects.get(id=generation_id, project=project)
+        
+        # Now that we've verified the event belongs to the project, proceed with deletion.
         
         # Delete all test cases linked to this event
-        # The ReferenceField makes this easy
         TestCase.objects(generation_event=generation_event).delete()
         
         # Delete the event itself
@@ -765,14 +1280,19 @@ def delete_test_case_generation(generation_id):
         return create_response({"message": "Test case generation event and all related test cases deleted."})
         
     except TestCaseGeneration.DoesNotExist:
-        return create_response(error="Generation event not found.", status_code=404)
+        # This error now correctly means "not found within this specific project"
+        return create_response(error="Generation event not found in this project.", status_code=404)
     except Exception as e:
         app.logger.error(f"Error deleting generation event {generation_id}: {e}", exc_info=True)
         return create_response(error="Failed to delete generation event.", status_code=500)
 
 
-@app.route('/api/suggest-test-cases-from-file', methods=['POST'])
-def suggest_test_cases_from_file_endpoint():
+@app.route('/api/project/<string:project_id>/suggest-test-cases-from-file', methods=['POST'])
+@jwt_required()
+def suggest_test_cases_from_file_endpoint(project_id):
+    current_user_id = get_jwt_identity()
+    project = _verify_project_ownership(project_id, current_user_id)# Verify ownership
+
     app.logger.info("Received request for /api/suggest-test-cases-from-file")
     if 'file' not in request.files: return create_response(error="No file part", status_code=400)
     file = request.files['file']
@@ -809,6 +1329,7 @@ def suggest_test_cases_from_file_endpoint():
 
             # 1. Create the parent TestCaseGeneration event
             generation_event = TestCaseGeneration(
+                project=project,
                 source_type=source_description,
                 test_case_count=len(all_tcs_flat)
             )
@@ -818,7 +1339,8 @@ def suggest_test_cases_from_file_endpoint():
             saved_test_cases = []
             for tc_data in all_tcs_flat:
                 new_case = TestCase(
-                    generation_event=generation_event, # <-- Link to the event
+                    project=project,
+                    generation_event=generation_event,
                     case_id_string=tc_data.get('id'),
                     scenario=tc_data.get('scenario_title') or tc_data.get('scenario'),
                     summary=tc_data.get('test_case_summary'),
@@ -901,13 +1423,17 @@ def _handle_ai_json_response_internal(ai_response_text: str, expects_array: bool
         }
 
 
-@app.route('/api/test-cases/<string:case_id>', methods=['PUT'])
-def update_test_case(case_id):
+@app.route('/api/project/<string:project_id>/test-cases/<string:case_id>', methods=['PUT'])
+@jwt_required()
+def update_test_case(project_id, case_id):
+    current_user_id = get_jwt_identity()
+    project = _verify_project_ownership(project_id, current_user_id)
+
     """Updates an existing test case in MongoDB."""
     app.logger.info(f"Received PUT request for TestCase ID: {case_id}")
     try:
         # Find the document by its unique MongoDB ID
-        case = TestCase.objects.get(id=case_id)
+        case = TestCase.objects.get(id=case_id, project=project)
         data = request.get_json()
         if not data:
             return create_response(error="Invalid request body.", status_code=400)
@@ -970,95 +1496,12 @@ def delete_ai_analysis(analysis_id):
         return create_response(error="Failed to delete analysis.", status_code=500)
 
 
-# @app.route('/api/suggest-test-cases-from-figma', methods=['POST'])
-# def suggest_test_cases_from_figma_endpoint():
-#     app.logger.info("Received request for /api/suggest-test-cases-from-figma")
-#     data = request.get_json()
-#     if not data or not all(k in data and data[k].strip() for k in ['figma_url', 'figma_token']):
-#         return create_response(error="Missing figma_url or figma_token", status_code=400)
-    
-#     figma_url, figma_token = data['figma_url'], data['figma_token']
-#     source_description = "Figma File" 
 
-#     try:
-#         file_key = extract_file_key_from_url(figma_url)
-#         if not file_key:
-#             return create_response(error="Could not extract valid File Key from the provided Figma URL.", status_code=400)
-#         source_description = f"Figma File ({file_key})"
-
-#         figma_json_content = get_figma_file_content(file_key, figma_token)
-#         extracted_text = process_figma_data(figma_json_content)
-
-#         if not extracted_text or not extracted_text.strip():
-#              return create_response(error="Could not extract any text content from the Figma file via API.", status_code=400)
-        
-#         extracted_text = truncate_text(extracted_text, MAX_AI_INPUT_CHARS)
-#         prompt = _generate_json_test_case_prompt(source_description, extracted_text, is_figma=True)
-#         ai_response_text = generate_text([prompt])
-#         parsed_result = _handle_ai_json_response_internal(ai_response_text, expects_array=True)
-
-#         if "error" in parsed_result:
-#             return create_response({
-#                 "suggestions": parsed_result.get("raw_text"),
-#                 "source": source_description,
-#                 "warning": parsed_result.get("warning")
-#             }, status_code=200)
-
-#         # --- MODIFIED DATABASE LOGIC ---
-#         suggestions_list = parsed_result.get("data", [])
-#         all_tcs_flat = get_flattened_tcs_backend(suggestions_list)
-        
-#         if not all_tcs_flat:
-#             app.logger.info("AI returned no test cases to save from Figma input.")
-#             return create_response({"suggestions": [], "source": source_description})
-
-#         # 1. Create the parent TestCaseGeneration event
-#         generation_event = TestCaseGeneration(
-#             source_type=source_description,
-#             test_case_count=len(all_tcs_flat)
-#         )
-#         generation_event.save()
-
-#         # 2. Create and link each TestCase
-#         saved_test_cases = []
-#         for tc_data in all_tcs_flat:
-#             new_case = TestCase(
-#                 generation_event=generation_event, # <-- Link to the event
-#                 case_id_string=tc_data.get('id'),
-#                 scenario=tc_data.get('scenario_title') or tc_data.get('scenario'),
-#                 summary=tc_data.get('test_case_summary'),
-#                 pre_condition=tc_data.get('pre_condition'),
-#                 test_steps=tc_data.get('test_steps', []),
-#                 test_data=tc_data.get('test_data', {}),
-#                 expected_result=tc_data.get('expected_result'),
-#                 priority=tc_data.get('priority'),
-#                 severity=tc_data.get('severity')
-#             )
-#             new_case.save()
-#             saved_test_cases.append(new_case)
-        
-#         # 3. (Optional) Update the event with the saved test case IDs
-#         generation_event.test_case_ids = [case.id for case in saved_test_cases]
-#         generation_event.save()
-        
-#         app.logger.info(f"Saved TestCaseGeneration event {generation_event.id} with {len(saved_test_cases)} test cases from Figma.")
-        
-#         # 4. Prepare and return the response
-#         saved_test_cases_dicts = [case.to_dict() for case in saved_test_cases]
-#         return create_response({"suggestions": saved_test_cases_dicts, "source": source_description})
-
-#     except ConnectionError as ce:
-#          return create_response(error=str(ce), status_code=502)
-#     except ValueError as ve:
-#          return create_response(error=f"Error processing Figma data: {ve}", status_code=500)
-#     except Exception as e:
-#          app.logger.error(f"Unexpected error processing Figma URL {figma_url}: {e}", exc_info=True)
-#          return create_response(error="An internal server error occurred processing the Figma request.", status_code=500)
-
-
-
-@app.route('/api/suggest-test-cases-from-figma', methods=['POST'])
-def suggest_test_cases_from_figma_endpoint():
+@app.route('/api/project/<string:project_id>/suggest-test-cases-from-figma', methods=['POST'])
+@jwt_required()
+def suggest_test_cases_from_figma_endpoint(project_id):
+    current_user_id = get_jwt_identity()
+    project = _verify_project_ownership(project_id, current_user_id) # Verify ownership
     app.logger.info("Received request for /api/suggest-test-cases-from-figma")
     data = request.get_json()
     if not data or not all(k in data and data[k].strip() for k in ['figma_url', 'figma_token']):
@@ -1107,6 +1550,7 @@ def suggest_test_cases_from_figma_endpoint():
         saved_test_cases = []
         for tc_data in all_tcs_flat:
             new_case = TestCase(
+                project=project,
                 generation_event=generation_event,
                 case_id_string=tc_data.get('id'),
                 scenario=tc_data.get('scenario_title') or tc_data.get('scenario'),
@@ -1193,8 +1637,12 @@ def recommend_automation_endpoint():
         return create_response(error="Failed to generate recommendation due to an internal error.", status_code=500)
 
 
-@app.route('/api/analyze-code-change-impact', methods=['POST'])
-def analyze_code_change_impact_endpoint():
+@app.route('/api/project/<string:project_id>/analyze-code-change-impact', methods=['POST'])
+@jwt_required()
+def analyze_code_change_impact_endpoint(project_id):
+    current_user_id = get_jwt_identity()
+    project = _verify_project_ownership(project_id, current_user_id)  # Verify ownership
+
     app.logger.info("Received request for /api/analyze-code-change-impact")
     data = request.get_json()
     required_fields = ['code_change_description', 'test_case_description']
@@ -1203,22 +1651,15 @@ def analyze_code_change_impact_endpoint():
 
     code_change_desc = truncate_text(data['code_change_description'], MAX_AI_INPUT_CHARS // 2)
     test_case_desc = truncate_text(data['test_case_description'], MAX_AI_INPUT_CHARS // 2)
-    app.logger.info(f"Analyzing impact of change '{code_change_desc[:100]}...' on test '{test_case_desc[:100]}...'") # Log from your version
-
+    source_info_text = f"Impact analysis for: '{test_case_desc[:50]}...'"
+    
     prompt = f"""
     Act as an AI assisting with Test Impact Analysis.
-    You are given a description of a code change and a description of an existing test case.
-    Based *only* on the semantics and keywords in these two descriptions, estimate the likelihood that the test case needs to be reviewed or updated due to this code change.
-    Return a single JSON object with the following keys:
-    - "impact_likelihood": (string, one of: "High", "Medium", "Low", "None")
-    - "reasoning": (string) Brief explanation linking keywords if possible.
-    Do NOT include any text outside of this single JSON object. Ensure all keys and string values are in double quotes.
+    Return a single JSON object with keys: "impact_likelihood" (string: "High", "Medium", "Low", or "None") and "reasoning" (string).
+    Do NOT include any text outside this single JSON object.
 
-    Example JSON output structure:
-    {{
-      "impact_likelihood": "High",
-      "reasoning": "Keywords 'login' and 'credentials' overlap significantly."
-    }}
+    Example:
+    {{ "impact_likelihood": "High", "reasoning": "Keywords overlap significantly." }}
 
     Code Change Description:
     ---
@@ -1232,11 +1673,36 @@ def analyze_code_change_impact_endpoint():
     """
     try:
         ai_response_text = generate_text([prompt])
-        # MODIFIED: Use the new JSON object response handler
-        return _handle_ai_json_object_response(ai_response_text, "Code Change Impact Analysis", "impact_analysis")
+        result = _handle_ai_json_object_response_internal(ai_response_text) 
+
+        analysis_to_save = {}
+        is_fallback = False
+        if "error" in result:
+            is_fallback = True
+            analysis_to_save = {"raw_text": result.get("raw_text"), "warning": result.get("warning")}
+            app.logger.warning(f"Saving raw text fallback for impact analysis.")
+        else:
+            analysis_to_save = result["data"]
+
+        # --- SAVE TO DATABASE ---
+        new_analysis = AiAnalysis(
+            project=project,
+            analysis_type='impact',
+            source_info=source_info_text,
+            analysis_json=analysis_to_save
+        )
+        new_analysis.save()
+        app.logger.info(f"Successfully saved impact analysis to MongoDB. DB ID: {new_analysis.id}")
+        
+        if is_fallback:
+            return create_response({"impact_analysis": analysis_to_save["raw_text"], "warning": analysis_to_save["warning"]}, status_code=200)
+        else:
+            return create_response(new_analysis.to_dict())
+
     except Exception as e:
-        app.logger.error(f"Error during GenAI call for code change impact: {e}", exc_info=True) # Log from your version
+        app.logger.error(f"Error during GenAI call for code change impact: {e}", exc_info=True)
         return create_response(error="Failed to generate impact analysis due to an internal error.", status_code=500)
+    
 
 # --- Main Execution Guard ---
 if __name__ == '__main__':
